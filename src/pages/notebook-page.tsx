@@ -47,6 +47,7 @@ export default function NotebookPage() {
   const [jarvisOpen, setJarvisOpen] = useState(false);
   const [insight, setInsight] = useState<JarvisInsight | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [blockAuthors, setBlockAuthors] = useState<Map<string, Profile>>(new Map());
 
   // Sidebar state
   const [showInviteForm, setShowInviteForm] = useState(false);
@@ -68,7 +69,18 @@ export default function NotebookPage() {
     const { data: blks } = await supabase
       .from("note_blocks").select("*").eq("notebook_id", notebookId)
       .order("position", { ascending: true });
-    setBlocks((blks as NoteBlock[]) || []);
+    const blockList = (blks as NoteBlock[]) || [];
+    setBlocks(blockList);
+
+    // Fetch author profiles for all blocks
+    const authorIds = [...new Set(blockList.map((b) => b.user_id).filter(Boolean))];
+    if (authorIds.length > 0) {
+      const { data: authorProfiles } = await supabase
+        .from("profiles").select("*").in("id", authorIds);
+      if (authorProfiles) {
+        setBlockAuthors(new Map((authorProfiles as Profile[]).map((p) => [p.id, p])));
+      }
+    }
 
     const { data: collabs } = await supabase
       .from("notebook_collaborators").select("*").eq("notebook_id", notebookId);
@@ -492,7 +504,8 @@ export default function NotebookPage() {
                   key={block.id}
                   block={block}
                   userId={user!.id}
-                  authorName={profile?.display_name || "You"}
+                  authorName={blockAuthors.get(block.user_id)?.display_name || profile?.display_name || "Unknown"}
+                  authorInitials={blockAuthors.get(block.user_id)?.avatar_initials || "?"}
                   onUpdate={(updates) => updateBlock(block.id, updates)}
                   onDelete={() => deleteBlock(block.id)}
                   onVote={(optionId) => voteOnPoll(block.id, optionId)}
@@ -557,11 +570,12 @@ export default function NotebookPage() {
 // Block Editor
 // ============================================================================
 function BlockEditor({
-  block, userId, authorName, onUpdate, onDelete, onVote,
+  block, userId, authorName, authorInitials, onUpdate, onDelete, onVote,
 }: {
   block: NoteBlock;
   userId: string;
   authorName: string;
+  authorInitials: string;
   onUpdate: (updates: Partial<NoteBlock>) => void;
   onDelete: () => void;
   onVote: (optionId: string) => void;
@@ -581,9 +595,10 @@ function BlockEditor({
         {/* Author attribution */}
         <div className="flex items-center gap-2 mb-2 select-none border-b border-slate-100/40 pb-1">
           <div className={`w-5 h-5 rounded-full ${getColorForName(authorName)} text-white flex items-center justify-center text-[9px] font-bold`}>
-            {authorName.split(" ").map((n) => n[0]).join("").substring(0, 2).toUpperCase()}
+            {authorInitials}
           </div>
           <span className="text-2xs font-bold text-slate-700">{authorName}</span>
+          <span className="text-[9px] text-slate-400 font-mono">Author</span>
         </div>
 
         {/* Editing toolbar */}

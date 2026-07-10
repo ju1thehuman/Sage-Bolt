@@ -45,6 +45,7 @@ export interface PollData {
 export interface NoteBlock {
   id: string;
   notebook_id: string;
+  user_id: string;
   position: number;
   type: BlockType;
   content: string;
