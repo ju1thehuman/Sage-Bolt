@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { motion } from "motion/react";
 import {
   Plus, Users, MessageSquare, LogOut, Check, X,
-  Clock, Mail, Compass, Send, Sparkles,
+  Clock, Mail, Compass, Send, Sparkles, Trash2,
 } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/lib/auth-context";
@@ -145,6 +145,18 @@ export default function DashboardPage() {
     setShowCreateModal(false);
     toast.success("Workspace created");
     navigate(`/notebook/${(data as Notebook).id}`);
+  }
+
+  async function deleteNotebook(id: string) {
+    // Optimistically remove from UI
+    setNotebooks((prev) => prev.filter((nb) => nb.id !== id));
+    const { error } = await supabase.from("notebooks").delete().eq("id", id);
+    if (error) {
+      toast.error("Failed to delete workspace");
+      loadDashboard(); // restore on failure
+    } else {
+      toast.success("Workspace deleted");
+    }
   }
 
   async function sendInvite(e: React.FormEvent) {
@@ -321,6 +333,18 @@ export default function DashboardPage() {
                     onClick={() => navigate(`/notebook/${nb.id}`)}
                     className="bg-white border border-slate-200/80 hover:border-slate-350 hover:shadow-md rounded-2xl p-5 cursor-pointer transition-all duration-200 group flex flex-col justify-between h-40 relative"
                   >
+                    {/* Delete button — top right, visible on hover */}
+                    <button
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        if (!confirm(`Delete "${nb.title}"? This cannot be undone.`)) return;
+                        deleteNotebook(nb.id);
+                      }}
+                      className="absolute top-3 right-3 p-1.5 rounded-lg opacity-0 group-hover:opacity-100 bg-white hover:bg-rose-50 hover:text-rose-600 text-slate-400 border border-slate-200 hover:border-rose-200 transition-all duration-150 shadow-2xs z-10"
+                      title="Delete workspace"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
                     <div className="space-y-2">
                       <div className="flex items-center justify-between">
                         <span className="text-[10px] bg-slate-100 text-slate-600 font-mono font-bold px-2 py-0.5 rounded-full uppercase tracking-wider">
