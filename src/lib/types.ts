@@ -24,6 +24,7 @@ export interface Collaborator {
 }
 
 export type BlockType = "text" | "table" | "bullets" | "poll";
+export type BulletStyle = "dot" | "arrow" | "checkbox" | "numbered";
 
 export interface TableData {
   headers: string[];
@@ -55,6 +56,7 @@ export interface NoteBlock {
   bold: boolean;
   italic: boolean;
   highlight_color: string | null;
+  bullet_style?: BulletStyle;
   created_at: string;
   updated_at: string;
 }

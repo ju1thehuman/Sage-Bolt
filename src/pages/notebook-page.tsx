@@ -1,16 +1,17 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/lib/auth-context";
-import { speakText, stopSpeaking } from "@/utils/speechUtils";
+import { speakText, stopSpeaking, isSpeechSynthesisAvailable } from "@/utils/speechUtils";
 import type {
   Notebook, NoteBlock, BlockType, TableData, PollData,
-  Collaborator, Profile, JarvisInsight,
+  Collaborator, Profile, JarvisInsight, BulletStyle,
 } from "@/lib/types";
 import {
-  Plus, Table, Check, Trash2,
+  Plus, Table as TableIcon, List, Type, Check, Trash2,
   Sparkles, Volume2, Square, ArrowLeft, Users, Mail,
   Send, Loader2, MessageSquare, Activity,
+  ChevronRight, ArrowRight, Circle, CheckSquare, Hash, X,
 } from "lucide-react";
 import { toast } from "sonner";
 import JarvisPanel from "@/components/jarvis-panel";
@@ -21,16 +22,41 @@ const FONT_SIZES: Record<string, string> = {
 };
 
 const HIGHLIGHT_COLORS = [
-  { class: "bg-amber-200", name: "amber" },
-  { class: "bg-emerald-200", name: "emerald" },
-  { class: "bg-sky-200", name: "sky" },
+  { class: "bg-amber-200", name: "amber", wrapClass: "bg-amber-100/60" },
+  { class: "bg-emerald-200", name: "emerald", wrapClass: "bg-emerald-100/60" },
+  { class: "bg-sky-200", name: "sky", wrapClass: "bg-sky-100/60" },
+  { class: "bg-rose-200", name: "rose", wrapClass: "bg-rose-100/60" },
 ];
 
 const COLLAB_COLORS = ["bg-indigo-600", "bg-emerald-600", "bg-blue-600", "bg-amber-600", "bg-slate-600"];
 
+const BULLET_STYLES: { value: BulletStyle; label: string; icon: typeof Circle }[] = [
+  { value: "dot", label: "Dot", icon: Circle },
+  { value: "arrow", label: "Arrow", icon: ArrowRight },
+  { value: "checkbox", label: "Checkbox", icon: CheckSquare },
+  { value: "numbered", label: "Numbered", icon: Hash },
+];
+
+const SLASH_COMMANDS: { type: BlockType; label: string; desc: string; icon: typeof Type }[] = [
+  { type: "text", label: "Text", desc: "Write a paragraph of notes", icon: Type },
+  { type: "bullets", label: "Bullets", desc: "Bulleted list with styles and nesting", icon: List },
+  { type: "table", label: "Table", desc: "Editable grid with rows and columns", icon: TableIcon },
+  { type: "poll", label: "Poll", desc: "Vote on options with your team", icon: Check },
+];
+
 function getColorForName(name: string) {
   const hash = name.split("").reduce((a, b) => a + b.charCodeAt(0), 0);
   return COLLAB_COLORS[hash % COLLAB_COLORS.length];
+}
+
+function getHighlightWrapClass(color: string | null | undefined): string {
+  const found = HIGHLIGHT_COLORS.find((c) => c.name === color);
+  return found ? found.wrapClass : "";
+}
+
+function getIndentLevel(line: string): number {
+  const match = line.match(/^(\s*)/);
+  return match ? Math.floor(match[1].length / 2) : 0;
 }
 
 export default function NotebookPage() {
@@ -57,6 +83,10 @@ export default function NotebookPage() {
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [inviteSuccess, setInviteSuccess] = useState(false);
 
+  // Slash command state
+  const [slashOpen, setSlashOpen] = useState(false);
+  const slashMenuRef = useRef<HTMLDivElement>(null);
+
   const loadNotebook = useCallback(async () => {
     if (!notebookId) return;
     setLoading(true);
@@ -72,7 +102,7 @@ export default function NotebookPage() {
     const blockList = (blks as NoteBlock[]) || [];
     setBlocks(blockList);
 
-    // Fetch author profiles for all blocks
+    // Fetch author profiles
     const authorIds = [...new Set(blockList.map((b) => b.user_id).filter(Boolean))];
     if (authorIds.length > 0) {
       const { data: authorProfiles } = await supabase
@@ -82,9 +112,23 @@ export default function NotebookPage() {
       }
     }
 
+    // Fetch collaborators with profiles in the same query
     const { data: collabs } = await supabase
       .from("notebook_collaborators").select("*").eq("notebook_id", notebookId);
-    setCollaborators((collabs as Collaborator[]) || []);
+    const collabList = (collabs as Collaborator[]) || [];
+
+    // Fetch collaborator profiles
+    if (collabList.length > 0) {
+      const collabUserIds = collabList.map((c) => c.user_id);
+      const { data: collabProfiles } = await supabase
+        .from("profiles").select("*").in("id", collabUserIds);
+      const profileMap = new Map<string, Profile>(
+        (collabProfiles as Profile[])?.map((p) => [p.id, p]) || []
+      );
+      setCollaborators(collabList.map((c) => ({ ...c, profile: profileMap.get(c.user_id) })));
+    } else {
+      setCollaborators([]);
+    }
 
     const { data: latestInsight } = await supabase
       .from("insights").select("*").eq("notebook_id", notebookId)
@@ -107,23 +151,6 @@ export default function NotebookPage() {
 
   useEffect(() => { loadNotebook(); }, [loadNotebook]);
 
-  // Load collaborator profiles
-  useEffect(() => {
-    async function loadProfiles() {
-      if (!notebookId || collaborators.length === 0) return;
-      const userIds = collaborators.map((c) => c.user_id);
-      const { data: profiles } = await supabase
-        .from("profiles").select("*").in("id", userIds);
-      const map = new Map<string, Profile>(
-        (profiles as Profile[])?.map((p) => [p.id, p]) || []
-      );
-      setCollaborators((prev) =>
-        prev.map((c) => ({ ...c, profile: map.get(c.user_id) }))
-      );
-    }
-    loadProfiles();
-  }, [notebookId, collaborators.length]);
-
   async function updateNotebookTitle(title: string) {
     if (!notebookId || !notebook) return;
     setNotebook({ ...notebook, title });
@@ -134,7 +161,10 @@ export default function NotebookPage() {
     if (!notebookId) return;
     const position = blocks.length;
     const newBlock: any = {
-      notebook_id: notebookId, position, type, content: "",
+      notebook_id: notebookId,
+      position,
+      type,
+      content: "",
     };
     if (type === "table") {
       newBlock.table_data = { headers: ["Column 1", "Column 2"], rows: [["", ""]] };
@@ -147,6 +177,9 @@ export default function NotebookPage() {
         ],
         voted_user_ids: [],
       };
+    } else if (type === "bullets") {
+      newBlock.bullet_style = "dot";
+      newBlock.content = "";
     }
     const { data, error } = await supabase
       .from("note_blocks").insert(newBlock).select().maybeSingle();
@@ -156,11 +189,12 @@ export default function NotebookPage() {
 
   async function updateBlock(id: string, updates: Partial<NoteBlock>) {
     setBlocks((prev) => prev.map((b) => (b.id === id ? { ...b, ...updates } : b)));
-    const { table_data, poll_data, content, ...rest } = updates;
+    const { table_data, poll_data, content, bullet_style, ...rest } = updates;
     const dbUpdates: any = { ...rest, updated_at: new Date().toISOString() };
     if (content !== undefined) dbUpdates.content = content;
     if (table_data !== undefined) dbUpdates.table_data = table_data;
     if (poll_data !== undefined) dbUpdates.poll_data = poll_data;
+    if (bullet_style !== undefined) dbUpdates.bullet_style = bullet_style;
     await supabase.from("note_blocks").update(dbUpdates).eq("id", id);
   }
 
@@ -189,6 +223,7 @@ export default function NotebookPage() {
             notebookId, email: inviteEmail.trim().toLowerCase(),
             inviterName: profile?.display_name || user?.email,
             notebookTitle: notebook?.title,
+            role: inviteRole,
           }),
         }
       );
@@ -225,10 +260,26 @@ export default function NotebookPage() {
     await updateBlock(blockId, { poll_data: updatedPoll });
   }
 
-  function handleSpeak(text: string) {
+  async function handleSpeak(text: string) {
     if (isSpeaking) { stopSpeaking(); setIsSpeaking(false); return; }
-    speakText(text, undefined, () => setIsSpeaking(false));
+    if (!text.trim()) { toast.error("No text to read"); return; }
+    if (!isSpeechSynthesisAvailable()) {
+      toast.error("Text-to-speech is not supported in this browser");
+      return;
+    }
     setIsSpeaking(true);
+    toast.success("Reading notes aloud...");
+    const ok = await speakText(text, undefined, () => setIsSpeaking(false));
+    if (!ok) {
+      setIsSpeaking(false);
+      toast.error("Could not play audio — check your browser's sound settings");
+    }
+  }
+
+  // Slash command: add block at end with type
+  function handleSlashSelect(type: BlockType) {
+    addBlock(type);
+    setSlashOpen(false);
   }
 
   if (loading) {
@@ -396,8 +447,8 @@ export default function NotebookPage() {
 
           {/* Collaborators */}
           {collaborators.map((c) => (
-            <div key={c.id} className="flex items-center gap-2.5 px-2.5 py-1.5 rounded-xl border border-slate-100 opacity-40 bg-slate-50/50">
-              <div className="w-7 h-7 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-2xs font-bold font-sans text-slate-600">
+            <div key={c.id} className="flex items-center gap-2.5 px-2.5 py-1.5 rounded-xl border border-slate-100 bg-slate-50/50">
+              <div className={`w-7 h-7 rounded-full ${getColorForName(c.profile?.display_name || "?")} text-white flex items-center justify-center text-2xs font-bold font-sans`}>
                 {c.profile?.avatar_initials || "?"}
               </div>
               <div className="min-w-0">
@@ -437,6 +488,12 @@ export default function NotebookPage() {
                 <button
                   onClick={() => {
                     if (isSpeaking) { stopSpeaking(); setIsSpeaking(false); }
+                    else {
+                      const fullText = blocks
+                        .map(b => b.type === "text" || b.type === "bullets" ? b.content : "")
+                        .filter(Boolean).join(". ");
+                      handleSpeak(fullText);
+                    }
                   }}
                   className={`p-2 rounded-xl border transition ${
                     isSpeaking
@@ -479,23 +536,98 @@ export default function NotebookPage() {
               </div>
             </div>
 
+            {/* Block type toolbar */}
+            <div className="px-6 py-2.5 border-b border-slate-100 bg-slate-50/50 flex items-center gap-2 shrink-0">
+              <span className="text-[10px] font-mono font-bold text-slate-400 uppercase tracking-wider mr-1">Add:</span>
+              <button
+                onClick={() => addBlock("text")}
+                className="flex items-center gap-1 px-2.5 py-1.5 bg-white border border-slate-200 hover:border-slate-400 hover:bg-slate-50 text-slate-700 text-2xs font-bold rounded-lg transition shadow-2xs cursor-pointer"
+              >
+                <Type className="w-3 h-3" /> Text
+              </button>
+              <button
+                onClick={() => addBlock("bullets")}
+                className="flex items-center gap-1 px-2.5 py-1.5 bg-white border border-slate-200 hover:border-slate-400 hover:bg-slate-50 text-slate-700 text-2xs font-bold rounded-lg transition shadow-2xs cursor-pointer"
+              >
+                <List className="w-3 h-3" /> Bullets
+              </button>
+              <button
+                onClick={() => addBlock("table")}
+                className="flex items-center gap-1 px-2.5 py-1.5 bg-white border border-slate-200 hover:border-slate-400 hover:bg-slate-50 text-slate-700 text-2xs font-bold rounded-lg transition shadow-2xs cursor-pointer"
+              >
+                <TableIcon className="w-3 h-3" /> Table
+              </button>
+              <button
+                onClick={() => addBlock("poll")}
+                className="flex items-center gap-1 px-2.5 py-1.5 bg-white border border-slate-200 hover:border-slate-400 hover:bg-slate-50 text-slate-700 text-2xs font-bold rounded-lg transition shadow-2xs cursor-pointer"
+              >
+                <Check className="w-3 h-3" /> Poll
+              </button>
+              <div className="ml-auto text-[9px] font-mono text-slate-400">
+                Tip: Press <kbd className="px-1 py-0.5 bg-slate-200 rounded text-[8px]">/</kbd> in empty area for quick add
+              </div>
+            </div>
+
             {/* Blocks Container */}
             <div
-              className="flex-1 overflow-y-auto p-6 space-y-4 max-h-[calc(100vh-200px)] scrollbar-thin cursor-text"
+              className="flex-1 overflow-y-auto p-6 space-y-4 max-h-[calc(100vh-260px)] scrollbar-thin"
               onClick={(e) => {
                 if (e.target === e.currentTarget && blocks.length === 0) {
-                  addBlock("text");
+                  setSlashOpen(true);
                 }
               }}
+              onKeyDown={(e) => {
+                if (e.key === "/" && blocks.length === 0 && e.target === e.currentTarget) {
+                  e.preventDefault();
+                  setSlashOpen(true);
+                }
+              }}
+              tabIndex={0}
             >
-              {blocks.length === 0 && (
-                <div className="h-full flex items-center justify-center">
-                  <textarea
-                    placeholder="Type here, or press / for options"
-                    className="w-full h-full bg-transparent text-base text-slate-700 focus:outline-none resize-none placeholder:text-slate-300"
-                    onFocus={() => addBlock("text")}
-                    readOnly
-                  />
+              {blocks.length === 0 && !slashOpen && (
+                <div className="h-full flex flex-col items-center justify-center gap-3 text-center">
+                  <Sparkles className="w-8 h-8 text-slate-300" />
+                  <p className="text-sm text-slate-400 font-sans">This brainstorm board is empty.</p>
+                  <p className="text-2xs text-slate-400 font-mono">Use the toolbar above or press / to add text, bullets, tables, or polls.</p>
+                </div>
+              )}
+
+              {/* Slash command menu */}
+              {slashOpen && (
+                <div className="flex items-center justify-center">
+                  <div
+                    ref={slashMenuRef}
+                    className="bg-white rounded-xl border border-slate-200 shadow-premium p-2 w-80 z-20"
+                  >
+                    <p className="text-[10px] font-mono font-bold text-slate-400 uppercase tracking-wider px-2 py-1.5">
+                      Insert a block
+                    </p>
+                    {SLASH_COMMANDS.map((cmd) => {
+                      const Icon = cmd.icon;
+                      return (
+                        <button
+                          key={cmd.type}
+                          onClick={() => handleSlashSelect(cmd.type)}
+                          className="w-full flex items-center gap-3 px-2 py-2 rounded-lg hover:bg-slate-50 transition text-left"
+                        >
+                          <div className="w-8 h-8 bg-slate-100 rounded-lg flex items-center justify-center">
+                            <Icon className="w-4 h-4 text-slate-600" />
+                          </div>
+                          <div>
+                            <p className="text-xs font-bold text-slate-800">{cmd.label}</p>
+                            <p className="text-[10px] text-slate-400 font-mono">{cmd.desc}</p>
+                          </div>
+                          <ChevronRight className="w-4 h-4 text-slate-300 ml-auto" />
+                        </button>
+                      );
+                    })}
+                    <button
+                      onClick={() => setSlashOpen(false)}
+                      className="w-full flex items-center justify-center gap-1 px-2 py-1.5 text-[10px] font-mono text-slate-400 hover:text-slate-600 transition"
+                    >
+                      <X className="w-3 h-3" /> Close
+                    </button>
+                  </div>
                 </div>
               )}
 
@@ -518,7 +650,7 @@ export default function NotebookPage() {
                   onClick={() => addBlock("text")}
                   className="py-4 px-4 text-slate-300 text-sm font-sans italic hover:text-slate-400 hover:bg-slate-50/30 rounded-xl cursor-pointer transition flex items-center gap-1"
                 >
-                  <Plus className="w-4 h-4" /> Click to add a note...
+                  <Plus className="w-4 h-4" /> Click to add a text note...
                 </div>
               )}
             </div>
@@ -528,7 +660,7 @@ export default function NotebookPage() {
               <div className="flex items-center gap-2">
                 <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />
                 <p className="text-[10px] text-slate-400 font-mono">
-                  Tip: Use the buttons above to add text, tables, or polls. Collaborators see updates on refresh.
+                  Collaborators see updates on refresh. Only block authors can edit their own blocks.
                 </p>
               </div>
               <div className="flex items-center gap-2 text-[10px] font-mono text-slate-400">
@@ -582,15 +714,20 @@ function BlockEditor({
 }) {
   const [isEditing, setIsEditing] = useState(false);
   const fontSizeClass = FONT_SIZES[block.font_size] || "text-base";
+  const isOwner = block.user_id === userId;
+  const highlightWrap = getHighlightWrapClass(block.highlight_color);
 
+  // ========================================================================
+  // TEXT & BULLETS
+  // ========================================================================
   if (block.type === "text" || block.type === "bullets") {
     return (
       <div
         className={`group border transition-all duration-200 py-3 relative px-4 rounded-xl ${
           isEditing
-            ? "!border-slate-200 !bg-slate-50/30 shadow-premium"
+            ? "border-slate-200 bg-slate-50/30 shadow-premium"
             : "border-transparent bg-transparent hover:bg-slate-50/45"
-        }`}
+        } ${highlightWrap}`}
       >
         {/* Author attribution */}
         <div className="flex items-center gap-2 mb-2 select-none border-b border-slate-100/40 pb-1">
@@ -598,11 +735,36 @@ function BlockEditor({
             {authorInitials}
           </div>
           <span className="text-2xs font-bold text-slate-700">{authorName}</span>
-          <span className="text-[9px] text-slate-400 font-mono">Author</span>
+          {isOwner ? (
+            <span className="text-[9px] text-slate-400 font-mono">Author</span>
+          ) : (
+            <span className="text-[9px] text-slate-400 font-mono bg-slate-100 px-1.5 py-0.5 rounded">Read-only</span>
+          )}
+          {/* Bullet style selector */}
+          {block.type === "bullets" && isOwner && (
+            <div className="flex items-center gap-0.5 ml-auto">
+              {BULLET_STYLES.map((bs) => {
+                const Icon = bs.icon;
+                const active = (block.bullet_style || "dot") === bs.value;
+                return (
+                  <button
+                    key={bs.value}
+                    onClick={() => onUpdate({ bullet_style: bs.value })}
+                    className={`w-5 h-5 flex items-center justify-center rounded transition ${
+                      active ? "bg-blue-100 text-blue-700" : "text-slate-400 hover:bg-slate-100"
+                    }`}
+                    title={bs.label}
+                  >
+                    <Icon className="w-3 h-3" />
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         {/* Editing toolbar */}
-        {isEditing && (
+        {isEditing && isOwner && block.type === "text" && (
           <div className="flex flex-wrap items-center justify-between border-b border-slate-100 pb-2.5 mb-1 gap-2">
             <div className="flex items-center gap-1">
               <button
@@ -635,6 +797,7 @@ function BlockEditor({
                     className={`w-3.5 h-3.5 rounded-full ${c.class} transition ${
                       block.highlight_color === c.name ? "ring-2 ring-blue-500 ring-offset-1 scale-110" : ""
                     }`}
+                    title={c.name}
                   />
                 ))}
                 <button
@@ -663,18 +826,30 @@ function BlockEditor({
         )}
 
         {/* Content */}
-        <textarea
-          value={block.content}
-          onChange={(e) => onUpdate({ content: e.target.value })}
-          onFocus={() => setIsEditing(true)}
-          placeholder={block.type === "bullets" ? "Enter bullet points (one per line)..." : "Write your notes..."}
-          className={`w-full bg-transparent border-none shadow-none focus:outline-none resize-none min-h-[60px] ${fontSizeClass} ${block.bold ? "font-bold" : ""} ${block.italic ? "italic" : ""} ${
-            block.highlight_color === "amber" ? "bg-amber-200/50" : block.highlight_color === "emerald" ? "bg-emerald-200/50" : block.highlight_color === "sky" ? "bg-sky-200/50" : ""
-          }`}
-        />
+        {block.type === "bullets" ? (
+          <BulletEditor
+            content={block.content}
+            bulletStyle={block.bullet_style || "dot"}
+            readOnly={!isOwner}
+            onChange={(content) => onUpdate({ content })}
+            onEditEnter={() => setIsEditing(true)}
+            onDelete={onDelete}
+            isEditing={isEditing}
+            setIsEditing={setIsEditing}
+          />
+        ) : (
+          <textarea
+            value={block.content}
+            onChange={(e) => onUpdate({ content: e.target.value })}
+            onFocus={() => isOwner && setIsEditing(true)}
+            readOnly={!isOwner}
+            placeholder="Write your notes..."
+            className={`w-full bg-transparent border-none shadow-none focus:outline-none resize-none min-h-[60px] ${fontSizeClass} ${block.bold ? "font-bold" : ""} ${block.italic ? "italic" : ""} ${!isOwner ? "cursor-default" : "cursor-text"}`}
+          />
+        )}
 
         {/* Read mode hover actions */}
-        {!isEditing && (
+        {!isEditing && isOwner && block.type === "text" && (
           <div className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition duration-150 flex gap-1">
             <button
               onClick={() => setIsEditing(true)}
@@ -684,49 +859,75 @@ function BlockEditor({
             </button>
           </div>
         )}
+
+        {/* Delete button for bullets when owner */}
+        {!isEditing && isOwner && block.type === "bullets" && (
+          <div className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition duration-150 flex gap-1">
+            <button
+              onClick={onDelete}
+              className="p-1.5 rounded-lg hover:bg-rose-50 hover:text-rose-600 text-slate-400 transition"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
       </div>
     );
   }
 
+  // ========================================================================
+  // TABLE
+  // ========================================================================
   if (block.type === "table" && block.table_data) {
     const table = block.table_data;
     return (
-      <div className="group border border-transparent bg-transparent transition-all duration-200 py-3 relative px-4 rounded-xl hover:bg-slate-50/45">
-        <div className="flex items-center gap-2 mb-2 text-[10px] font-mono text-slate-400 uppercase tracking-wider font-bold">
-          <Table className="w-3.5 h-3.5 text-amber-500" /> Table Block
+      <div className="group border border-slate-200 bg-white transition-all duration-200 py-3 relative px-4 rounded-xl hover:shadow-premium">
+        <div className="flex items-center gap-2 mb-3 text-[10px] font-mono text-slate-400 uppercase tracking-wider font-bold">
+          <TableIcon className="w-3.5 h-3.5 text-amber-500" /> Table Block
+          {!isOwner && <span className="text-[9px] bg-slate-100 px-1.5 py-0.5 rounded normal-case tracking-normal">Read-only</span>}
+          {isOwner && (
+            <button
+              onClick={onDelete}
+              className="ml-auto p-1.5 rounded-lg hover:bg-rose-50 hover:text-rose-600 text-slate-400 transition"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          )}
         </div>
-        <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-slate-100 border border-slate-100 rounded-lg">
-            <thead className="bg-slate-50">
-              <tr>
+        <div className="overflow-x-auto rounded-lg border border-slate-200">
+          <table className="min-w-full border-collapse">
+            <thead>
+              <tr className="bg-slate-100 border-b-2 border-slate-200">
                 {table.headers.map((header, i) => (
-                  <th key={i} className="px-3 py-2 text-left">
+                  <th key={i} className="px-3 py-2 text-left border-r border-slate-200 last:border-r-0">
                     <input
                       value={header}
+                      readOnly={!isOwner}
                       onChange={(e) => {
                         const headers = [...table.headers];
                         headers[i] = e.target.value;
                         onUpdate({ table_data: { ...table, headers } });
                       }}
-                      className="w-full bg-transparent border-b border-transparent focus:border-blue-500 focus:outline-none text-xs font-bold text-slate-500 uppercase tracking-wider font-mono"
+                      className={`w-full bg-transparent border-none ${isOwner ? "focus:outline-none focus:border-blue-500" : "cursor-default"} text-xs font-bold text-slate-700 uppercase tracking-wider font-mono`}
                     />
                   </th>
                 ))}
               </tr>
             </thead>
-            <tbody className="bg-white divide-y divide-slate-100">
+            <tbody>
               {table.rows.map((row, ri) => (
-                <tr key={ri} className="hover:bg-slate-50/50">
+                <tr key={ri} className="border-b border-slate-200 last:border-b-0 hover:bg-slate-50/50">
                   {row.map((cell, ci) => (
-                    <td key={ci} className="px-3 py-2">
+                    <td key={ci} className="px-3 py-2 border-r border-slate-200 last:border-r-0">
                       <input
                         value={cell}
+                        readOnly={!isOwner}
                         onChange={(e) => {
                           const rows = table.rows.map((r) => [...r]);
                           rows[ri][ci] = e.target.value;
                           onUpdate({ table_data: { ...table, rows } });
                         }}
-                        className="w-full bg-transparent border-b border-transparent focus:border-blue-500 focus:outline-none text-sm text-slate-700"
+                        className={`w-full bg-transparent border-none ${isOwner ? "focus:outline-none focus:text-blue-600" : "cursor-default"} text-sm text-slate-700`}
                       />
                     </td>
                   ))}
@@ -735,84 +936,310 @@ function BlockEditor({
             </tbody>
           </table>
         </div>
-        <div className="flex items-center gap-2 mt-2">
-          <button
-            onClick={() => {
-              const newTable: TableData = {
-                ...table,
-                rows: [...table.rows, table.headers.map(() => "")],
-              };
-              onUpdate({ table_data: newTable });
-            }}
-            className="text-[10px] font-mono bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md px-2 py-1 transition"
-          >
-            + Add Row
-          </button>
-          <button
-            onClick={() => {
-              const newTable: TableData = {
-                ...table,
-                headers: [...table.headers, `Column ${table.headers.length + 1}`],
-                rows: table.rows.map((r) => [...r, ""]),
-              };
-              onUpdate({ table_data: newTable });
-            }}
-            className="text-[10px] font-mono bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md px-2 py-1 transition"
-          >
-            + Add Column
-          </button>
-          <button
-            onClick={onDelete}
-            className="p-1.5 rounded-lg hover:bg-rose-50 hover:text-rose-600 text-slate-400 transition ml-auto"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-          </button>
-        </div>
+        {isOwner && (
+          <div className="flex items-center gap-2 mt-2">
+            <button
+              onClick={() => {
+                const newTable: TableData = {
+                  ...table,
+                  rows: [...table.rows, table.headers.map(() => "")],
+                };
+                onUpdate({ table_data: newTable });
+              }}
+              className="text-[10px] font-mono bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md px-2 py-1 transition"
+            >
+              + Add Row
+            </button>
+            <button
+              onClick={() => {
+                const newTable: TableData = {
+                  ...table,
+                  headers: [...table.headers, `Column ${table.headers.length + 1}`],
+                  rows: table.rows.map((r) => [...r, ""]),
+                };
+                onUpdate({ table_data: newTable });
+              }}
+              className="text-[10px] font-mono bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md px-2 py-1 transition"
+            >
+              + Add Column
+            </button>
+          </div>
+        )}
       </div>
     );
   }
 
+  // ========================================================================
+  // POLL
+  // ========================================================================
   if (block.type === "poll" && block.poll_data) {
-    const poll = block.poll_data;
-    const hasVoted = poll.voted_user_ids.includes(userId);
-    const totalVotes = poll.options.reduce((sum, o) => sum + o.votes, 0);
     return (
-      <div className="group border border-transparent bg-transparent transition-all duration-200 py-3 relative px-4 rounded-xl hover:bg-slate-50/45">
-        <div className="flex items-center gap-2 mb-3 text-[10px] font-mono text-slate-400 uppercase tracking-wider font-bold">
-          <Check className="w-3.5 h-3.5 text-blue-500" /> Poll Block
-        </div>
+      <PollBlock
+        poll={block.poll_data}
+        isOwner={isOwner}
+        userId={userId}
+        onUpdate={onUpdate}
+        onDelete={onDelete}
+        onVote={onVote}
+      />
+    );
+  }
+
+  return null;
+}
+
+// ============================================================================
+// Bullet Editor — visual bullets with nesting support
+// ============================================================================
+function BulletEditor({
+  content, bulletStyle, readOnly, onChange, onEditEnter, onDelete,
+  isEditing, setIsEditing,
+}: {
+  content: string;
+  bulletStyle: BulletStyle;
+  readOnly: boolean;
+  onChange: (content: string) => void;
+  onEditEnter: () => void;
+  onDelete: () => void;
+  isEditing: boolean;
+  setIsEditing: (v: boolean) => void;
+}) {
+  // Local lines state — sync to parent only on blur to avoid re-render focus loss
+  const [localLines, setLocalLines] = useState<string[]>(() => {
+    const split = content.split("\n");
+    return split.length === 0 ? [""] : split;
+  });
+  const [focusLine, setFocusLine] = useState<number | null>(null);
+  const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
+
+  // Sync in from parent only if content changed externally (bullet_style update etc.)
+  useEffect(() => {
+    const currentJoined = localLines.join("\n");
+    if (content !== currentJoined) {
+      setLocalLines(content ? content.split("\n") : [""]);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [content]);
+
+  // Focus management
+  useEffect(() => {
+    if (focusLine !== null && inputRefs.current[focusLine]) {
+      inputRefs.current[focusLine]!.focus();
+      setFocusLine(null);
+    }
+  }, [localLines, focusLine]);
+
+  function commit(lines: string[]) {
+    setLocalLines(lines);
+    onChange(lines.join("\n"));
+  }
+
+  function getBulletIcon(style: BulletStyle, index: number, indent: number) {
+    const indentPx = indent * 20;
+    if (style === "arrow") return <span style={{ paddingLeft: indentPx }} className="text-slate-400 select-none">→</span>;
+    if (style === "checkbox") return <span style={{ paddingLeft: indentPx }} className="text-slate-400 select-none">☐</span>;
+    if (style === "numbered") return <span style={{ paddingLeft: indentPx }} className="text-slate-400 select-none font-mono text-[10px]">{index + 1}.</span>;
+    return <span style={{ paddingLeft: indentPx }} className="text-slate-400 select-none">•</span>;
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>, lineIndex: number) {
+    if (readOnly) return;
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const newLines = [...localLines];
+      const currentIndent = getIndentLevel(newLines[lineIndex]);
+      newLines.splice(lineIndex + 1, 0, "  ".repeat(currentIndent));
+      setFocusLine(lineIndex + 1);
+      commit(newLines);
+    } else if (e.key === "Tab") {
+      e.preventDefault();
+      const newLines = [...localLines];
+      const currentIndent = getIndentLevel(newLines[lineIndex]);
+      if (e.shiftKey && currentIndent > 0) {
+        newLines[lineIndex] = newLines[lineIndex].replace(/^  /, "");
+      } else {
+        newLines[lineIndex] = "  " + newLines[lineIndex];
+      }
+      commit(newLines);
+    } else if (e.key === "Backspace" && localLines[lineIndex].trimStart() === "" && localLines.length > 1) {
+      e.preventDefault();
+      const newLines = localLines.filter((_, i) => i !== lineIndex);
+      setFocusLine(Math.max(0, lineIndex - 1));
+      commit(newLines);
+    }
+  }
+
+  function updateLine(lineIndex: number, value: string) {
+    const currentIndent = getIndentLevel(localLines[lineIndex]);
+    const newLines = [...localLines];
+    newLines[lineIndex] = "  ".repeat(currentIndent) + value;
+    setLocalLines(newLines);
+  }
+
+  function flushLine(lineIndex: number, value: string) {
+    const currentIndent = getIndentLevel(localLines[lineIndex]);
+    const newLines = [...localLines];
+    newLines[lineIndex] = "  ".repeat(currentIndent) + value;
+    commit(newLines);
+  }
+
+  function addLine() {
+    const newLines = [...localLines, ""];
+    setFocusLine(newLines.length - 1);
+    commit(newLines);
+  }
+
+  if (readOnly) {
+    return (
+      <div className="space-y-1">
+        {localLines.length === 0 || (localLines.length === 1 && localLines[0] === "") ? (
+          <p className="text-sm text-slate-400 italic">No bullet points yet.</p>
+        ) : (
+          localLines.map((line, i) => {
+            const indent = getIndentLevel(line);
+            const text = line.trimStart();
+            if (!text) return null;
+            return (
+              <div key={i} className="flex items-start gap-2 text-sm text-slate-700">
+                {getBulletIcon(bulletStyle, i, indent)}
+                <span>{text}</span>
+              </div>
+            );
+          })
+        )}
+      </div>
+    );
+  }
+
+  // Editable: per-line inputs with keyboard nesting
+  return (
+    <div className="space-y-1" onFocus={onEditEnter}>
+      {localLines.map((line, i) => {
+        const indent = getIndentLevel(line);
+        const text = line.trimStart();
+        return (
+          <div key={i} className="flex items-start gap-2">
+            {getBulletIcon(bulletStyle, i, indent)}
+            <input
+              ref={(el) => { inputRefs.current[i] = el; }}
+              type="text"
+              value={text}
+              onChange={(e) => updateLine(i, e.target.value)}
+              onBlur={(e) => flushLine(i, e.target.value)}
+              onKeyDown={(e) => handleKeyDown(e, i)}
+              placeholder="Type a bullet point..."
+              className="flex-1 text-sm text-slate-700 bg-transparent border-none focus:outline-none focus:text-blue-600"
+            />
+          </div>
+        );
+      })}
+      {isEditing && (
+        <>
+          <button
+            onClick={addLine}
+            className="text-[10px] font-mono text-slate-400 hover:text-slate-600 transition flex items-center gap-1 pt-1"
+          >
+            <Plus className="w-3 h-3" /> Add bullet
+          </button>
+          <div className="flex items-center gap-2 pt-2 border-t border-slate-100 mt-2">
+            <span className="text-[9px] font-mono text-slate-400">Tab = indent • Shift+Tab = outdent • Enter = new line</span>
+            <button
+              onClick={() => setIsEditing(false)}
+              className="ml-auto bg-emerald-600 hover:bg-emerald-700 text-white text-3xs font-bold uppercase font-mono px-2 py-1 rounded shadow-xs flex items-center gap-1 cursor-pointer"
+            >
+              <Check className="w-3 h-3" /> Done
+            </button>
+            <button
+              onClick={onDelete}
+              className="p-1.5 rounded-lg hover:bg-rose-50 hover:text-rose-600 text-slate-400 transition"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// PollBlock — edit mode toggle hides option inputs until owner clicks "Edit"
+// ============================================================================
+function PollBlock({
+  poll, isOwner, userId, onUpdate, onDelete, onVote,
+}: {
+  poll: PollData;
+  isOwner: boolean;
+  userId: string;
+  onUpdate: (updates: Partial<NoteBlock>) => void;
+  onDelete: () => void;
+  onVote: (optionId: string) => void;
+}) {
+  const [isEditing, setIsEditing] = useState(false);
+  const hasVoted = poll.voted_user_ids.includes(userId);
+  const totalVotes = poll.options.reduce((sum, o) => sum + o.votes, 0);
+
+  return (
+    <div className="group border border-slate-200 bg-white transition-all duration-200 py-3 relative px-4 rounded-xl hover:shadow-premium">
+      <div className="flex items-center gap-2 mb-3 text-[10px] font-mono text-slate-400 uppercase tracking-wider font-bold">
+        <Check className="w-3.5 h-3.5 text-blue-500" /> Poll Block
+        {!isOwner && <span className="text-[9px] bg-slate-100 px-1.5 py-0.5 rounded normal-case tracking-normal">Read-only</span>}
+        {isOwner && (
+          <div className="ml-auto flex items-center gap-1">
+            <button
+              onClick={() => setIsEditing(!isEditing)}
+              className={`px-2 py-0.5 rounded text-[9px] font-mono uppercase tracking-wider transition ${
+                isEditing
+                  ? "bg-emerald-100 text-emerald-700 border border-emerald-200"
+                  : "bg-slate-100 text-slate-500 border border-slate-200 hover:bg-slate-200"
+              }`}
+            >
+              {isEditing ? "Done" : "Edit"}
+            </button>
+            <button
+              onClick={onDelete}
+              className="p-1.5 rounded-lg hover:bg-rose-50 hover:text-rose-600 text-slate-400 transition"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+      </div>
+
+      {isEditing && isOwner ? (
         <input
           value={poll.question}
           onChange={(e) => onUpdate({ poll_data: { ...poll, question: e.target.value } })}
           placeholder="Poll question..."
-          className="w-full bg-transparent border-b border-transparent focus:border-blue-500 focus:outline-none text-base font-bold text-slate-800 mb-3"
+          className="w-full bg-transparent border-b border-blue-400 focus:outline-none text-base font-bold text-slate-800 mb-3"
         />
-        <div className="space-y-2">
-          {poll.options.map((opt) => {
-            const pct = totalVotes > 0 ? (opt.votes / totalVotes) * 100 : 0;
-            return (
-              <div key={opt.id} className="space-y-1">
+      ) : (
+        <p className="text-base font-bold text-slate-800 mb-3">
+          {poll.question || "Untitled poll"}
+        </p>
+      )}
+
+      <div className="space-y-2">
+        {poll.options.map((opt, idx) => {
+          const pct = totalVotes > 0 ? (opt.votes / totalVotes) * 100 : 0;
+          return (
+            <div key={opt.id} className="space-y-1">
+              {isEditing && isOwner ? (
                 <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => onVote(opt.id)}
-                    disabled={hasVoted}
-                    className={`relative flex-1 p-2.5 rounded-lg border overflow-hidden text-left transition ${
-                      hasVoted ? "border-slate-200/80 cursor-default" : "border-slate-200/80 hover:border-blue-300 cursor-pointer"
-                    }`}
-                  >
-                    {hasVoted && (
-                      <div
-                        className="absolute inset-0 bg-blue-500/10 transition-all duration-500"
-                        style={{ width: `${pct}%` }}
-                      />
-                    )}
-                    <span className="relative text-xs text-slate-700 font-semibold">{opt.text || "Option"}</span>
-                    {hasVoted && (
-                      <span className="relative float-right text-[10px] font-mono text-slate-500">
-                        {opt.votes} ({pct.toFixed(0)}%)
-                      </span>
-                    )}
-                  </button>
+                  <input
+                    value={opt.text}
+                    onChange={(e) => {
+                      const updated: PollData = {
+                        ...poll,
+                        options: poll.options.map((o) =>
+                          o.id === opt.id ? { ...o, text: e.target.value } : o
+                        ),
+                      };
+                      onUpdate({ poll_data: updated });
+                    }}
+                    placeholder={`Option ${idx + 1} text...`}
+                    className="flex-1 text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-blue-400"
+                  />
                   <button
                     onClick={() => {
                       const updated: PollData = {
@@ -826,38 +1253,53 @@ function BlockEditor({
                     <Trash2 className="w-3 h-3" />
                   </button>
                 </div>
-              </div>
-            );
-          })}
-          {!hasVoted && (
-            <button
-              onClick={() => {
-                const updated: PollData = {
-                  ...poll,
-                  options: [...poll.options, { id: crypto.randomUUID(), text: "", votes: 0 }],
-                };
-                onUpdate({ poll_data: updated });
-              }}
-              className="text-[10px] font-mono text-blue-600 hover:text-blue-700 transition flex items-center gap-1"
-            >
-              <Plus className="w-3 h-3" /> Add option
-            </button>
-          )}
-        </div>
-        {hasVoted && (
-          <p className="mt-2 text-[10px] font-mono text-slate-400">
-            {totalVotes} {totalVotes === 1 ? "vote" : "votes"} total
-          </p>
+              ) : (
+                <button
+                  onClick={() => onVote(opt.id)}
+                  disabled={hasVoted}
+                  className={`relative w-full p-2.5 rounded-lg border overflow-hidden text-left transition ${
+                    hasVoted ? "border-slate-300 cursor-default" : "border-slate-200 hover:border-blue-400 cursor-pointer bg-slate-50"
+                  }`}
+                >
+                  {hasVoted && (
+                    <div
+                      className="absolute inset-0 bg-blue-500/10 transition-all duration-500"
+                      style={{ width: `${pct}%` }}
+                    />
+                  )}
+                  <span className="relative text-xs text-slate-700 font-semibold">
+                    {opt.text || `Option ${idx + 1}`}
+                  </span>
+                  {hasVoted && (
+                    <span className="relative float-right text-[10px] font-mono text-slate-500">
+                      {opt.votes} ({pct.toFixed(0)}%)
+                    </span>
+                  )}
+                </button>
+              )}
+            </div>
+          );
+        })}
+        {isEditing && isOwner && (
+          <button
+            onClick={() => {
+              const updated: PollData = {
+                ...poll,
+                options: [...poll.options, { id: crypto.randomUUID(), text: "", votes: 0 }],
+              };
+              onUpdate({ poll_data: updated });
+            }}
+            className="text-[10px] font-mono text-blue-600 hover:text-blue-700 transition flex items-center gap-1"
+          >
+            <Plus className="w-3 h-3" /> Add option
+          </button>
         )}
-        <button
-          onClick={onDelete}
-          className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 p-1.5 rounded-lg hover:bg-rose-50 hover:text-rose-600 text-slate-400 transition"
-        >
-          <Trash2 className="w-3.5 h-3.5" />
-        </button>
       </div>
-    );
-  }
-
-  return null;
+      {hasVoted && !isEditing && (
+        <p className="mt-2 text-[10px] font-mono text-slate-400">
+          {totalVotes} {totalVotes === 1 ? "vote" : "votes"} total
+        </p>
+      )}
+    </div>
+  );
 }

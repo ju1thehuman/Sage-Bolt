@@ -202,16 +202,35 @@ export default function ShareModal({
     }
     setSending(true);
     try {
-      const { error } = await supabase.from("email_logs").insert({
-        notebook_id: notebook!.id,
-        recipient: recipientEmail,
-        subject,
-        provider,
-        sections_shared: sections,
-      });
-      if (error) throw error;
+      const briefingText = getBriefingText();
+      const encodedSubject = encodeURIComponent(subject);
+      const encodedBody = encodeURIComponent(briefingText);
+      const encodedTo = encodeURIComponent(recipientEmail);
+
+      // Open provider-specific web compose in a new tab
+      let composeUrl: string;
+      if (provider === "gmail") {
+        composeUrl = `https://mail.google.com/mail/?view=cm&fs=1&to=${encodedTo}&su=${encodedSubject}&body=${encodedBody}`;
+      } else {
+        // Outlook web compose
+        composeUrl = `https://outlook.office.com/mail/deepoptions?action=compose&to=${encodedTo}&subject=${encodedSubject}&body=${encodedBody}`;
+      }
+      window.open(composeUrl, "_blank", "noopener,noreferrer");
+
+      try {
+        await supabase.from("email_logs").insert({
+          notebook_id: notebook!.id,
+          recipient: recipientEmail,
+          subject,
+          provider,
+          sections_shared: sections,
+        });
+      } catch {
+        // Logging failure shouldn't block the user flow
+      }
+
       setSentSuccess(true);
-      toast.success("Briefing dispatched successfully");
+      toast.success(`${provider === "gmail" ? "Gmail" : "Outlook"} compose opened in a new tab`);
     } catch (err: any) {
       toast.error(err.message || "Failed to send briefing");
     } finally {
@@ -254,9 +273,9 @@ export default function ShareModal({
                 <Check className="w-6 h-6" />
               </div>
               <div>
-                <p className="font-bold text-sm text-slate-800">Briefing Dispatched</p>
+                <p className="font-bold text-sm text-slate-800">Compose Tab Opened</p>
                 <p className="text-xs text-slate-500 mt-1">
-                  Sent via {provider === "gmail" ? "Gmail" : "Outlook"} to {recipientEmail}
+                  {provider === "gmail" ? "Gmail" : "Outlook"} compose opened in a new tab for {recipientEmail}. Send the email from there.
                 </p>
               </div>
               <button
@@ -390,7 +409,7 @@ export default function ShareModal({
                   className="flex-1 flex items-center justify-center gap-1.5 px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl transition shadow-sm cursor-pointer disabled:opacity-50"
                 >
                   <Send className="w-3.5 h-3.5" />
-                  {sending ? "Sending..." : "Send Briefing"}
+                  {sending ? "Opening..." : "Send Briefing"}
                 </button>
               </div>
             </>

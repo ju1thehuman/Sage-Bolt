@@ -13,7 +13,7 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { notebookId, email, inviterName, notebookTitle } = await req.json();
+    const { notebookId, email, inviterName, notebookTitle, role } = await req.json();
 
     if (!notebookId || !email) {
       return new Response(
@@ -104,7 +104,7 @@ Deno.serve(async (req: Request) => {
       .insert({
         notebook_id: notebookId,
         user_id: targetUser.id,
-        role: "member",
+        role: role || "member",
       });
 
     if (insertError) {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion } from "motion/react";
 import {
@@ -21,6 +21,7 @@ export default function DashboardPage() {
   const navigate = useNavigate();
   const [notebooks, setNotebooks] = useState<NotebookWithMeta[]>([]);
   const [allTags, setAllTags] = useState<{ tag: Tag; count: number }[]>([]);
+  const [recentBlocks, setRecentBlocks] = useState<any[]>([]);
   const [, setLoading] = useState(true);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newTitle, setNewTitle] = useState("");
@@ -34,67 +35,91 @@ export default function DashboardPage() {
   const [inviteSuccess, setInviteSuccess] = useState(false);
   const [inviteError, setInviteError] = useState<string | null>(null);
 
-  useEffect(() => {
-    async function loadDashboard() {
-      if (!user) { setLoading(false); return; }
-      const { data: nbs } = await supabase
-        .from("notebooks")
-        .select("*")
-        .order("last_updated", { ascending: false });
+  const loadDashboard = useCallback(async () => {
+    if (!user) { setLoading(false); return; }
+    const { data: nbs } = await supabase
+      .from("notebooks")
+      .select("*")
+      .order("last_updated", { ascending: false });
 
-      if (!nbs || nbs.length === 0) {
-        setNotebooks([]);
-        setLoading(false);
-        return;
-      }
-
-      const nbList = nbs as Notebook[];
-      const result: NotebookWithMeta[] = [];
-
-      for (const nb of nbList) {
-        const [{ data: tags }, { count: collabCount }, { count: blockCount }] =
-          await Promise.all([
-            supabase
-              .from("notebook_tags")
-              .select("tag_id, tags(id, name)")
-              .eq("notebook_id", nb.id),
-            supabase
-              .from("notebook_collaborators")
-              .select("*", { count: "exact", head: true })
-              .eq("notebook_id", nb.id),
-            supabase
-              .from("note_blocks")
-              .select("*", { count: "exact", head: true })
-              .eq("notebook_id", nb.id),
-          ]);
-
-        const tagList: Tag[] =
-          (tags?.map((t: any) => t.tags).filter(Boolean) as Tag[]) || [];
-
-        result.push({
-          ...nb,
-          tags: tagList,
-          collaboratorCount: collabCount || 0,
-          blockCount: blockCount || 0,
-        });
-      }
-
-      setNotebooks(result);
-
-      // Aggregate tag counts
-      const tagMap = new Map<string, { tag: Tag; count: number }>();
-      for (const nb of result) {
-        for (const tag of nb.tags) {
-          const existing = tagMap.get(tag.id);
-          if (existing) existing.count++;
-          else tagMap.set(tag.id, { tag, count: 1 });
-        }
-      }
-      setAllTags(Array.from(tagMap.values()).sort((a, b) => b.count - a.count));
+    if (!nbs || nbs.length === 0) {
+      setNotebooks([]);
+      setRecentBlocks([]);
       setLoading(false);
+      return;
     }
-    loadDashboard();
+
+    const nbList = nbs as Notebook[];
+    const result: NotebookWithMeta[] = [];
+
+    for (const nb of nbList) {
+      const [{ data: tags }, { count: collabCount }, { count: blockCount }] =
+        await Promise.all([
+          supabase
+            .from("notebook_tags")
+            .select("tag_id, tags(id, name)")
+            .eq("notebook_id", nb.id),
+          supabase
+            .from("notebook_collaborators")
+            .select("*", { count: "exact", head: true })
+            .eq("notebook_id", nb.id),
+          supabase
+            .from("note_blocks")
+            .select("*", { count: "exact", head: true })
+            .eq("notebook_id", nb.id),
+        ]);
+
+      const tagList: Tag[] =
+        (tags?.map((t: any) => t.tags).filter(Boolean) as Tag[]) || [];
+
+      result.push({
+        ...nb,
+        tags: tagList,
+        collaboratorCount: collabCount || 0,
+        blockCount: blockCount || 0,
+      });
+    }
+
+    setNotebooks(result);
+
+    // Aggregate tag counts
+    const tagMap = new Map<string, { tag: Tag; count: number }>();
+    for (const nb of result) {
+      for (const tag of nb.tags) {
+        const existing = tagMap.get(tag.id);
+        if (existing) existing.count++;
+        else tagMap.set(tag.id, { tag, count: 1 });
+      }
+    }
+    setAllTags(Array.from(tagMap.values()).sort((a, b) => b.count - a.count));
+
+    // Fetch recent text blocks across all notebooks
+    const notebookIds = nbList.map(nb => nb.id);
+    if (notebookIds.length > 0) {
+      const { data: recentBlks } = await supabase
+        .from("note_blocks")
+        .select("id, content, type, notebook_id, updated_at")
+        .in("notebook_id", notebookIds)
+        .eq("type", "text")
+        .order("updated_at", { ascending: false })
+        .limit(5);
+      
+      if (recentBlks) {
+        const enriched = (recentBlks as any[])
+          .filter(b => b.content && b.content.length > 20)
+          .slice(0, 4)
+          .map(b => {
+            const nb = nbList.find(n => n.id === b.notebook_id);
+            return { ...b, notebookTitle: nb?.title || "Unknown" };
+          });
+        setRecentBlocks(enriched);
+      }
+    }
+
+    setLoading(false);
   }, [user]);
+
+  useEffect(() => { loadDashboard(); }, [loadDashboard]);
 
   const ownedWorkspaces = notebooks.filter(
     (nb) => nb.user_id === user?.id
@@ -154,6 +179,7 @@ export default function DashboardPage() {
       } else {
         setInviteSuccess(true);
         setInviteEmail("");
+        loadDashboard();
         setTimeout(() => {
           setInviteSuccess(false);
           setShowInviteModal(false);
@@ -165,9 +191,6 @@ export default function DashboardPage() {
       setIsInviting(false);
     }
   }
-
-  const recentBlocks: any[] = [];
-  // TODO: fetch recent blocks from DB if needed
 
   const totalCollaborators = notebooks.reduce((sum, nb) => sum + nb.collaboratorCount, 0);
   const totalBlocks = notebooks.reduce((sum, nb) => sum + nb.blockCount, 0);

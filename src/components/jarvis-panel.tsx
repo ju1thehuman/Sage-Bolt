@@ -76,7 +76,7 @@ export default function JarvisPanel({
     }
   }
 
-  function handleSpeak(text: string) {
+  async function handleSpeak(text: string) {
     if (isSpeaking) { stopSpeaking(); onStopSpeaking(); return; }
     onSpeak(text);
   }
