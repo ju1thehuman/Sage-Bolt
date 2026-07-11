@@ -73,7 +73,7 @@ export default function NotebookPage() {
     async function load() {
       const [nbRes, colRes] = await Promise.all([
         supabase.from("notebooks").select("*").eq("id", notebookId!).maybeSingle(),
-        supabase.from("collaborators").select("*, profile:profiles(*)").eq("notebook_id", notebookId!),
+        supabase.from("notebook_collaborators").select("*, profile:profiles(*)").eq("notebook_id", notebookId!),
       ]);
 
       if (nbRes.data) {
@@ -205,7 +205,7 @@ export default function NotebookPage() {
       const result = await res.json();
       if (!res.ok) throw new Error(result.error || "Invite failed");
       setInviteSuccess(true); setInviteEmail(""); setInviteRole("Co-Founder");
-      const { data: colRes } = await supabase.from("collaborators").select("*, profile:profiles(*)").eq("notebook_id", notebookId!);
+      const { data: colRes } = await supabase.from("notebook_collaborators").select("*, profile:profiles(*)").eq("notebook_id", notebookId!);
       if (colRes) setCollaborators(colRes as Collaborator[]);
       setTimeout(() => { setInviteSuccess(false); setShowInviteForm(false); }, 2500);
     } catch (err: any) {
