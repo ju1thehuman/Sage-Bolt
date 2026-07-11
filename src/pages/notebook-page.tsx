@@ -67,6 +67,8 @@ export default function NotebookPage() {
   const [notebook, setNotebook] = useState<Notebook | null>(null);
   const [blocks, setBlocks] = useState<NoteBlock[]>([]);
   const [collaborators, setCollaborators] = useState<Collaborator[]>([]);
+  const [ownerProfile, setOwnerProfile] = useState<Profile | null>(null);
+  const [activeUsers, setActiveUsers] = useState<Profile[]>([]);
   const [notebooks, setNotebooks] = useState<Notebook[]>([]);
   const [loading, setLoading] = useState(true);
   const [shareOpen, setShareOpen] = useState(false);
@@ -95,6 +97,10 @@ export default function NotebookPage() {
       .from("notebooks").select("*").eq("id", notebookId).maybeSingle();
     if (!nb) { toast.error("Notebook not found"); navigate("/"); return; }
     setNotebook(nb as Notebook);
+
+    const { data: ownerProf } = await supabase
+      .from("profiles").select("*").eq("id", nb.user_id).maybeSingle();
+    if (ownerProf) setOwnerProfile(ownerProf as Profile);
 
     const { data: blks } = await supabase
       .from("note_blocks").select("*").eq("notebook_id", notebookId)
@@ -150,6 +156,71 @@ export default function NotebookPage() {
   }, [user]);
 
   useEffect(() => { loadNotebook(); }, [loadNotebook]);
+
+  // Setup Real-time Subscriptions
+  useEffect(() => {
+    if (!notebookId || !profile) return;
+
+    // Real-time note blocks
+    const blockChannel = supabase
+      .channel(`public:note_blocks:notebook_id=${notebookId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "note_blocks",
+          filter: `notebook_id=eq.${notebookId}`,
+        },
+        () => {
+          // Robust real-time sync by reloading blocks when changes occur
+          supabase
+            .from("note_blocks")
+            .select("*")
+            .eq("notebook_id", notebookId)
+            .order("position", { ascending: true })
+            .then(async ({ data: blks }) => {
+              const blockList = (blks as NoteBlock[]) || [];
+              setBlocks(blockList);
+              const authorIds = [...new Set(blockList.map((b) => b.user_id).filter(Boolean))];
+              if (authorIds.length > 0) {
+                const { data: authorProfiles } = await supabase
+                  .from("profiles").select("*").in("id", authorIds);
+                if (authorProfiles) {
+                  setBlockAuthors(new Map((authorProfiles as Profile[]).map((p) => [p.id, p])));
+                }
+              }
+            });
+        }
+      )
+      .subscribe();
+
+    // Presence
+    const presenceChannel = supabase.channel(`presence:notebook_${notebookId}`, {
+      config: { presence: { key: profile.id } }
+    });
+
+    presenceChannel
+      .on("presence", { event: "sync" }, () => {
+        const state = presenceChannel.presenceState();
+        const profiles: Profile[] = [];
+        for (const id in state) {
+          const userState = state[id][0] as any;
+          if (userState?.profile) profiles.push(userState.profile);
+        }
+        setActiveUsers(profiles);
+      })
+      .subscribe(async (status) => {
+        if (status === "SUBSCRIBED") {
+          await presenceChannel.track({ profile });
+        }
+      });
+
+    return () => {
+      supabase.removeChannel(blockChannel);
+      supabase.removeChannel(presenceChannel);
+    };
+  }, [notebookId, profile]);
 
   async function updateNotebookTitle(title: string) {
     if (!notebookId || !notebook) return;
@@ -432,29 +503,46 @@ export default function NotebookPage() {
           )}
 
           {/* Owner */}
-          <div className="flex items-center gap-2.5 px-2.5 py-1.5 rounded-xl border border-slate-200 bg-white shadow-3xs">
-            <div className="relative">
-              <div className="w-7 h-7 rounded-full bg-slate-900 text-white flex items-center justify-center text-2xs font-bold font-sans">
-                {profile?.avatar_initials || "?"}
+          <div className="flex items-center justify-between p-2 rounded-xl border border-slate-200 bg-white shadow-3xs">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="relative shrink-0">
+                <div className="w-7 h-7 rounded-full bg-slate-900 text-white flex items-center justify-center text-2xs font-bold font-sans">
+                  {ownerProfile?.avatar_initials || "?"}
+                </div>
+                {activeUsers.find(u => u.id === ownerProfile?.id) && (
+                  <span className="absolute bottom-0 right-0 h-2 w-2 rounded-full bg-emerald-500 ring-2 ring-white shadow-sm" />
+                )}
               </div>
-              <span className="absolute bottom-0 right-0 h-2 w-2 rounded-full bg-emerald-500 ring-2 ring-white shadow-sm" />
+              <div className="min-w-0">
+                <p className="text-2xs font-bold text-slate-800 truncate">{ownerProfile?.display_name || "Owner"}</p>
+                <p className="text-[9px] text-slate-400 font-mono">Owner</p>
+              </div>
             </div>
-            <div className="min-w-0">
-              <p className="text-2xs font-bold text-slate-800 truncate">{profile?.display_name || "You"}</p>
-              <p className="text-[9px] text-slate-400 font-mono">Owner</p>
-            </div>
+            {profile?.id === ownerProfile?.id && (
+              <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest shrink-0 ml-2 bg-slate-50 px-1.5 py-0.5 rounded">You</span>
+            )}
           </div>
 
           {/* Collaborators */}
           {collaborators.map((c) => (
-            <div key={c.id} className="flex items-center gap-2.5 px-2.5 py-1.5 rounded-xl border border-slate-100 bg-slate-50/50">
-              <div className={`w-7 h-7 rounded-full ${getColorForName(c.profile?.display_name || "?")} text-white flex items-center justify-center text-2xs font-bold font-sans`}>
-                {c.profile?.avatar_initials || "?"}
+            <div key={c.id} className="flex items-center justify-between px-2.5 py-1.5 rounded-xl border border-slate-100 bg-slate-50/50">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className="relative shrink-0">
+                  <div className={`w-7 h-7 rounded-full ${getColorForName(c.profile?.display_name || "?")} text-white flex items-center justify-center text-2xs font-bold font-sans`}>
+                    {c.profile?.avatar_initials || "?"}
+                  </div>
+                  {activeUsers.find(u => u.id === c.user_id) && (
+                    <span className="absolute bottom-0 right-0 h-2 w-2 rounded-full bg-emerald-500 ring-2 ring-white shadow-sm" />
+                  )}
+                </div>
+                <div className="min-w-0">
+                  <p className="text-2xs font-bold text-slate-800 truncate">{c.profile?.display_name || "Unknown"}</p>
+                  <p className="text-[9px] text-slate-400 font-mono">{c.role}</p>
+                </div>
               </div>
-              <div className="min-w-0">
-                <p className="text-2xs font-bold text-slate-800 truncate">{c.profile?.display_name || "Unknown"}</p>
-                <p className="text-[9px] text-slate-400 font-mono">{c.role}</p>
-              </div>
+              {profile?.id === c.user_id && (
+                <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest shrink-0 ml-2 bg-slate-200/50 px-1.5 py-0.5 rounded">You</span>
+              )}
             </div>
           ))}
         </div>
@@ -570,7 +658,7 @@ export default function NotebookPage() {
 
             {/* Blocks Container */}
             <div
-              className="flex-1 overflow-y-auto p-6 space-y-4 max-h-[calc(100vh-260px)] scrollbar-thin"
+              className="flex-1 overflow-y-auto p-4 space-y-2 max-h-[calc(100vh-260px)] scrollbar-thin"
               onClick={(e) => {
                 if (e.target === e.currentTarget && blocks.length === 0) {
                   setSlashOpen(true);
@@ -658,13 +746,20 @@ export default function NotebookPage() {
             {/* Footer */}
             <div className="p-4 border-t border-slate-100 flex flex-wrap items-center justify-between gap-4 bg-slate-50 shrink-0">
               <div className="flex items-center gap-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
                 <p className="text-[10px] text-slate-400 font-mono">
-                  Collaborators see updates on refresh. Only block authors can edit their own blocks.
+                  All changes are saved and synced in real-time. Only block authors can edit their own blocks.
                 </p>
               </div>
               <div className="flex items-center gap-2 text-[10px] font-mono text-slate-400">
-                <Users className="w-3.5 h-3.5" /> {collaborators.length + 1} active
+                <div className="flex items-center -space-x-2 mr-2">
+                  {activeUsers.map((u) => (
+                    <div key={u.id} className={`w-6 h-6 rounded-full border-2 border-slate-50 ${getColorForName(u.display_name || "?")} text-white flex items-center justify-center text-[8px] font-bold z-10`} title={u.display_name}>
+                      {u.avatar_initials || "?"}
+                    </div>
+                  ))}
+                </div>
+                <Users className="w-3.5 h-3.5" /> {activeUsers.length} online
               </div>
             </div>
           </div>
@@ -717,28 +812,31 @@ function BlockEditor({
   const isOwner = block.user_id === userId;
   const highlightWrap = getHighlightWrapClass(block.highlight_color);
 
+  // Prevent empty text blocks from rendering for non-owners
+  if (block.type === "text" && !block.content?.trim() && !isOwner) {
+    return null;
+  }
+
   // ========================================================================
   // TEXT & BULLETS
   // ========================================================================
   if (block.type === "text" || block.type === "bullets") {
     return (
       <div
-        className={`group border transition-all duration-200 py-3 relative px-4 rounded-xl ${
+        className={`group border transition-all duration-200 py-2 relative px-3 rounded-xl ${
           isEditing
             ? "border-slate-200 bg-slate-50/30 shadow-premium"
             : "border-transparent bg-transparent hover:bg-slate-50/45"
         } ${highlightWrap}`}
       >
         {/* Author attribution */}
-        <div className="flex items-center gap-2 mb-2 select-none border-b border-slate-100/40 pb-1">
-          <div className={`w-5 h-5 rounded-full ${getColorForName(authorName)} text-white flex items-center justify-center text-[9px] font-bold`}>
+        <div className="flex items-center gap-1.5 mb-0.5 select-none opacity-60">
+          <div className={`w-3.5 h-3.5 rounded-full ${getColorForName(authorName)} text-white flex items-center justify-center text-[7px] font-bold`}>
             {authorInitials}
           </div>
-          <span className="text-2xs font-bold text-slate-700">{authorName}</span>
-          {isOwner ? (
-            <span className="text-[9px] text-slate-400 font-mono">Author</span>
-          ) : (
-            <span className="text-[9px] text-slate-400 font-mono bg-slate-100 px-1.5 py-0.5 rounded">Read-only</span>
+          <span className="text-[9px] font-bold text-slate-700">{authorName}</span>
+          {isOwner && (
+            <span className="text-[8px] text-slate-400 font-mono">Author</span>
           )}
           {/* Bullet style selector */}
           {block.type === "bullets" && isOwner && (
@@ -839,12 +937,19 @@ function BlockEditor({
           />
         ) : (
           <textarea
+            autoFocus={isOwner && !block.content}
             value={block.content}
             onChange={(e) => onUpdate({ content: e.target.value })}
             onFocus={() => isOwner && setIsEditing(true)}
+            onBlur={(e) => {
+              setIsEditing(false);
+              if (isOwner && !e.target.value.trim()) {
+                onDelete();
+              }
+            }}
             readOnly={!isOwner}
             placeholder="Write your notes..."
-            className={`w-full bg-transparent border-none shadow-none focus:outline-none resize-none min-h-[60px] ${fontSizeClass} ${block.bold ? "font-bold" : ""} ${block.italic ? "italic" : ""} ${!isOwner ? "cursor-default" : "cursor-text"}`}
+            className={`w-full bg-transparent border-none shadow-none focus:outline-none resize-none min-h-[40px] ${fontSizeClass} ${block.bold ? "font-bold" : ""} ${block.italic ? "italic" : ""} ${!isOwner ? "cursor-default" : "cursor-text"}`}
           />
         )}
 
