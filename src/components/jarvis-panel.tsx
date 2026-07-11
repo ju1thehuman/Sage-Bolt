@@ -28,6 +28,67 @@ export default function JarvisPanel({
 }: JarvisPanelProps) {
   const [loading, setLoading] = useState(false);
 
+  async function callGeminiClientSide(notesContent: string, apiKey: string): Promise<JarvisInsight> {
+    const systemInstruction = `You are Sage AI, an elite strategic executive advisor for high-agency tech founders.
+Give sharp, analytical, quantitative, and context-specific assessments.
+Group brainstorm content by theme (Cost, Timeline, Risk, Dependencies, Team).
+For each theme: what was said, what it means, what could go wrong, what's missing.
+Flag contradictions and explain trade-offs.
+Keep responses concise — sentences, not paragraphs.
+Never invent data or metrics not provided in the text.
+Generate a proactiveInsight: an unprompted, high-value observation about something the team missed.`;
+
+    const prompt = `Notes/Brainstorming Content:
+\"\"\"
+${notesContent || "(Empty notes)"}
+\"\"\"
+
+Analyze the notes and extract decision analytics, risks, changing factors, action items, themes, contradictions, SWOT, and a concise summary.
+
+Return JSON with these fields:
+- shortResponse: sharp 1-2 sentence executive summary
+- summary: 1-2 sentence professional summary
+- actionItems: [{task, assignee, priority}]
+- risks: [string]
+- changingFactors: [string]
+- decisionAnalytics: [{metric, value, context}]
+- themes: [{theme, whatWasSaid, whatItMeans, whatCouldGoWrong, whatsMissing}]
+- contradictions: [{items, tradeoff}]
+- swot: {strengths, weaknesses, opportunities, threats}
+- proactiveInsight: string`;
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: systemInstruction }] },
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.1,
+            responseMimeType: "application/json"
+          }
+        })
+      }
+    );
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.error?.message || `Gemini API call failed (${response.status})`);
+    }
+
+    const result = await response.json();
+    const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) {
+      throw new Error("No response content from Gemini API");
+    }
+
+    // Clean JSON markdown wrapper if any
+    const cleanText = text.replace(/^```json\s*/i, "").replace(/\s*```$/i, "").trim();
+    return JSON.parse(cleanText) as JarvisInsight;
+  }
+
   async function runAnalysis() {
     setLoading(true);
     try {
@@ -47,27 +108,88 @@ export default function JarvisPanel({
         .filter(Boolean)
         .join("\n\n");
 
-      const { data: sessionData } = await supabase.auth.getSession();
-      const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/jarvis-analyze`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${sessionData.session?.access_token}`,
-            apikey: import.meta.env.VITE_SUPABASE_ANON_KEY,
-          },
-          body: JSON.stringify({ notesContent, notebookId }),
-        }
-      );
+      let data: JarvisInsight | null = null;
+      let usedClientSide = false;
 
-      if (!response.ok) {
-        const err = await response.json().catch(() => ({}));
-        throw new Error(err.error || `Analysis failed (${response.status})`);
+      // 1. Try Remote/Local Edge Function first
+      try {
+        const { data: sessionData } = await supabase.auth.getSession();
+        const response = await fetch(
+          `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/jarvis-analyze`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${sessionData.session?.access_token}`,
+              apikey: import.meta.env.VITE_SUPABASE_ANON_KEY,
+            },
+            body: JSON.stringify({ notesContent, notebookId }),
+          }
+        );
+
+        if (response.ok) {
+          data = await response.json();
+        }
+      } catch (e) {
+        console.warn("Edge function failed, checking client-side API options", e);
       }
 
-      const data = await response.json();
-      onInsightUpdate(data as JarvisInsight);
+      const clientGeminiKey = import.meta.env.VITE_GEMINI_API_KEY || "";
+
+      // 2. If Edge Function failed or returned a fallback mock (fallbackActive === true), AND we have a client key
+      if ((!data || data.fallbackActive) && clientGeminiKey) {
+        console.log("Edge Function unavailable or on fallback. Running client-side analysis...");
+        data = await callGeminiClientSide(notesContent, clientGeminiKey);
+        usedClientSide = true;
+      }
+
+      if (!data) {
+        throw new Error("Analysis failed and no backup API key was available.");
+      }
+
+      // 3. If we executed client-side, we must save the insight and tags manually to Supabase
+      if (usedClientSide) {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (user) {
+          // Save insight
+          await supabase.from("insights").insert({
+            notebook_id: notebookId,
+            user_id: user.id,
+            analysis: data,
+          });
+
+          // Upsert tags
+          if (data.themes && data.themes.length > 0) {
+            for (const theme of data.themes) {
+              const tagName = theme.theme;
+              const { data: existingTag } = await supabase
+                .from("tags")
+                .select("id")
+                .eq("name", tagName)
+                .maybeSingle();
+
+              let tagId = existingTag?.id;
+              if (!tagId) {
+                const { data: newTag } = await supabase
+                  .from("tags")
+                  .insert({ name: tagName })
+                  .select("id")
+                  .maybeSingle();
+                tagId = newTag?.id;
+              }
+
+              if (tagId) {
+                await supabase
+                  .from("notebook_tags")
+                  .insert({ notebook_id: notebookId, tag_id: tagId })
+                  .then(() => {});
+              }
+            }
+          }
+        }
+      }
+
+      onInsightUpdate(data);
       toast.success("Analysis complete");
     } catch (err: any) {
       toast.error(err.message || "Failed to analyze notes");

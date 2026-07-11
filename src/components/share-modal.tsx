@@ -36,156 +36,406 @@ export default function ShareModal({
   if (!isOpen) return null;
 
   function getBriefingText(): string {
-    let text = `BRIEFING: ${notebook?.title}\n${"=".repeat(50)}\n\n`;
-    if (sections.summary && insight) {
-      text += `I. EXECUTIVE SUMMARY\n${insight.summary}\n\n`;
+    let text = `BRIEFING: ${notebook?.title || "Notebook"}\n${"=".repeat(50)}\n\n`;
+    
+    if (sections.summary && insight?.summary) {
+      text += `I. STRATEGIC EXECUTIVE SUMMARY\n"${insight.summary}"\n\n`;
     }
+    
     if (sections.notes && blocks.length > 0) {
-      text += `II. MEETING NOTES\n`;
+      text += `II. BRAINBOARD MEETING NOTES\n`;
       blocks.forEach((b) => {
-        if (b.type === "text" || b.type === "bullets") {
+        if (b.type === "text" && b.content) {
           text += `${b.content}\n\n`;
-        } else if (b.type === "table" && b.table_data) {
+        }
+        if (b.type === "bullets" && b.content) {
+          text += `${b.content}\n\n`;
+        }
+        if (b.type === "table" && b.table_data) {
           text += `${b.table_data.headers.join(" | ")}\n`;
           b.table_data.rows.forEach((r) => (text += `${r.join(" | ")}\n`));
           text += "\n";
-        } else if (b.type === "poll" && b.poll_data) {
+        }
+        if (b.type === "poll" && b.poll_data) {
           text += `${b.poll_data.question}\n`;
           b.poll_data.options.forEach((o) => (text += `  - ${o.text}: ${o.votes} votes\n`));
           text += "\n";
         }
       });
+      text += `\n`;
     }
-    if (sections.risks && insight?.risks?.length) {
-      text += `III. STRATEGIC RISKS\n`;
-      insight.risks.forEach((r) => (text += `• ${r}\n`));
-      text += "\n";
+    
+    if (sections.risks && insight?.risks && insight.risks.length > 0) {
+      text += `III. CRITICAL STRATEGIC RISKS & BLINDSPOTS\n`;
+      const uniqueRisks = Array.from(new Set(insight.risks));
+      uniqueRisks.forEach((r) => { text += `• ${r}\n`; });
+      text += `\n`;
     }
-    if (sections.dependencies && insight?.changingFactors?.length) {
-      text += `IV. CHANGING FACTORS\n`;
-      insight.changingFactors.forEach((f) => (text += `• ${f}\n`));
-      text += "\n";
+    
+    if (sections.dependencies && insight?.changingFactors && insight.changingFactors.length > 0) {
+      text += `IV. SHIFTING VARIABLES & DEPENDENCIES\n`;
+      const uniqueFactors = Array.from(new Set(insight.changingFactors));
+      uniqueFactors.forEach((cf) => { text += `• ${cf}\n`; });
+      text += `\n`;
     }
-    if (sections.actions && insight?.actionItems?.length) {
-      text += `V. ACTION ITEMS\n`;
-      insight.actionItems.forEach((a) => (text += `[ ] ${a.task} (Owner: ${a.assignee} | ${a.priority})\n`));
-      text += "\n";
+    
+    if (sections.actions && insight?.actionItems && insight.actionItems.length > 0) {
+      text += `V. DELIVERABLE ACTION ROADMAP\n`;
+      const seenActions = new Set();
+      insight.actionItems.forEach((ai) => {
+        if (seenActions.has(ai.task)) return;
+        seenActions.add(ai.task);
+        text += `[ ] ${ai.task} (Owner: ${ai.assignee} | Priority: ${ai.priority})\n`;
+      });
+      text += `\n`;
     }
+
     if (sections.swot && insight?.swot) {
-      text += `VI. SWOT\nStrengths: ${insight.swot.strengths.join("; ")}\n`;
-      text += `Weaknesses: ${insight.swot.weaknesses.join("; ")}\n`;
-      text += `Opportunities: ${insight.swot.opportunities.join("; ")}\n`;
-      text += `Threats: ${insight.swot.threats.join("; ")}\n\n`;
+      text += `VI. SWOT MATRIX ANALYSIS\n`;
+      text += `STRENGTHS:\n${insight.swot.strengths.map(s => `• ${s}`).join("\n")}\n\n`;
+      text += `WEAKNESSES:\n${insight.swot.weaknesses.map(w => `• ${w}`).join("\n")}\n\n`;
+      text += `OPPORTUNITIES:\n${insight.swot.opportunities.map(o => `• ${o}`).join("\n")}\n\n`;
+      text += `THREATS:\n${insight.swot.threats.map(t => `• ${t}`).join("\n")}\n\n`;
     }
-    if (sections.themes && insight?.themes?.length) {
-      text += `VII. THEMES\n`;
-      insight.themes.forEach((t) => (text += `${t.theme}: ${t.whatWasSaid} — ${t.whatItMeans}\n`));
-      text += "\n";
+
+    if (sections.analytics && insight?.decisionAnalytics && insight.decisionAnalytics.length > 0) {
+      text += `VII. DECISION ANALYTICS & METRICS\n`;
+      insight.decisionAnalytics.forEach((m) => {
+        text += `• ${m.metric}: ${m.value} (${m.context})\n`;
+      });
+      text += `\n`;
     }
-    if (sections.analytics && insight?.decisionAnalytics?.length) {
-      text += `VIII. DECISION ANALYTICS\n`;
-      insight.decisionAnalytics.forEach((m) => (text += `• ${m.metric}: ${m.value} — ${m.context}\n`));
+
+    if (sections.themes && insight?.themes && insight.themes.length > 0) {
+      text += `VIII. CO-FOUNDER THEMATIC BRAINBOARD ANALYSIS\n`;
+      insight.themes.forEach((t) => {
+        text += `Theme: ${t.theme}\n`;
+        text += `  • What Was Said: ${t.whatWasSaid}\n`;
+        text += `  • What It Means: ${t.whatItMeans}\n`;
+        text += `  • What Could Go Wrong: ${t.whatCouldGoWrong}\n`;
+        text += `  • What's Missing: ${t.whatsMissing}\n\n`;
+      });
     }
-    return text;
+
+    return text.trim() || "No sections selected. Please toggle the checkboxes below to compile your briefing.";
   }
 
   function generatePDF(): jsPDF {
-    const doc = new jsPDF();
+    const doc = new jsPDF({
+      orientation: "portrait",
+      unit: "mm",
+      format: "a4",
+    });
     let y = 20;
 
-    // Header bar
-    doc.setFillColor(15, 23, 42);
-    doc.rect(0, 0, 210, 12, "F");
-    doc.setFontSize(16);
+    // Title / Cover branding with premium navy bar header
+    doc.setFillColor(15, 23, 42); // slate-900
+    doc.rect(0, 0, 210, 8, "F");
+
+    doc.setFontSize(22);
     doc.setFont("helvetica", "bold");
-    doc.setTextColor(255, 255, 255);
-    doc.text(`Briefing: ${notebook?.title || "Notebook"}`, 14, 8);
+    doc.setTextColor(15, 23, 42); // slate-900
+    doc.text("EXECUTIVE BRIEFING", 14, y);
+    y += 10;
 
-    y = 22;
-    doc.setTextColor(15, 23, 42);
+    doc.setFontSize(11);
+    doc.setFont("helvetica", "normal");
+    doc.setTextColor(71, 85, 105); // slate-600
+    doc.text(`Subject: ${notebook?.title || "Notebook"}`, 14, y);
+    y += 6;
+    doc.text(`Created on: ${new Date().toLocaleDateString()} | 2026`, 14, y);
+    y += 10;
 
-    if (sections.summary && insight) {
-      if (y > 260) { doc.addPage(); y = 20; }
-      doc.setFontSize(13);
-      doc.setTextColor(37, 99, 235);
-      doc.text("I. EXECUTIVE SUMMARY", 14, y);
-      y += 7;
-      doc.setFontSize(10);
-      doc.setFont("helvetica", "normal");
-      doc.setTextColor(30, 41, 59);
-      const lines = doc.splitTextToSize(insight.summary, 180);
-      doc.text(lines, 14, y);
-      y += lines.length * 5 + 5;
-    }
-    if (sections.notes && blocks.length > 0) {
-      if (y > 250) { doc.addPage(); y = 20; }
-      doc.setFontSize(13);
+    // Line separator
+    doc.setDrawColor(226, 232, 240);
+    doc.line(14, y, 196, y);
+    y += 10;
+
+    // 1. Share Summary Section
+    if (sections.summary && insight?.summary) {
       doc.setFont("helvetica", "bold");
-      doc.setTextColor(37, 99, 235);
-      doc.text("II. MEETING NOTES", 14, y);
-      y += 7;
-      doc.setFontSize(10);
+      doc.setFontSize(13);
+      doc.setTextColor(37, 99, 235); // blue-600
+      doc.text("I. STRATEGIC EXECUTIVE SUMMARY", 14, y);
+      y += 8;
+
       doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+      doc.setTextColor(30, 41, 59); // slate-800
+      const splitSummary = doc.splitTextToSize(insight.summary, 180);
+      doc.text(splitSummary, 14, y);
+      y += (splitSummary.length * 5) + 8;
+    }
+
+    // 2. Share Notes Section
+    if (sections.notes && blocks.length > 0) {
+      if (y > 240) { doc.addPage(); y = 20; }
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(13);
+      doc.setTextColor(37, 99, 235); // blue-600
+      doc.text("II. BRAINBOARD MEETING NOTES", 14, y);
+      y += 8;
+
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
       doc.setTextColor(30, 41, 59);
-      blocks.forEach((b) => {
-        if (y > 270) { doc.addPage(); y = 20; }
-        if (b.type === "text" || b.type === "bullets") {
-          const l = doc.splitTextToSize(b.content, 180);
-          doc.text(l, 14, y);
-          y += l.length * 5 + 3;
-        } else if (b.type === "table" && b.table_data) {
+
+      blocks.forEach((block) => {
+        if (y > 255) {
+          doc.addPage();
+          y = 20;
+        }
+
+        if (block.type === "text" && block.content) {
+          const splitContent = doc.splitTextToSize(block.content, 180);
+          doc.text(splitContent, 14, y);
+          y += (splitContent.length * 5) + 6;
+        } else if (block.type === "bullets" && block.content) {
           doc.setFont("helvetica", "bold");
-          doc.text(b.table_data.headers.join("  |  "), 14, y);
+          doc.setTextColor(71, 85, 105);
+          doc.text("Directives & Guidelines:", 14, y);
           y += 5;
           doc.setFont("helvetica", "normal");
-          b.table_data.rows.forEach((row) => {
-            if (y > 270) { doc.addPage(); y = 20; }
-            doc.text(row.join("  |  "), 14, y);
-            y += 5;
+          doc.setTextColor(30, 41, 59);
+          
+          const bulletLines = block.content.split("\n")
+            .map(line => line.trim())
+            .filter(line => line.length > 0);
+          const uniqueLines = Array.from(new Set(bulletLines));
+
+          uniqueLines.forEach((line) => {
+            const cleanText = line.replace(/^[•\-\*\d\.\s]+/g, "").trim();
+            if (!cleanText) return;
+            const splitBullet = doc.splitTextToSize(`• ${cleanText}`, 175);
+            doc.text(splitBullet, 18, y);
+            y += (splitBullet.length * 5) + 2.5;
           });
-          y += 3;
+          y += 4;
+        } else if (block.type === "table" && block.table_data) {
+          doc.setFont("helvetica", "bold");
+          doc.setTextColor(71, 85, 105);
+          doc.text("Structured Matrix Grid:", 14, y);
+          y += 6;
+          doc.setFont("helvetica", "normal");
+          doc.setTextColor(30, 41, 59);
+
+          const headers = block.table_data.headers;
+          const rows = block.table_data.rows;
+          
+          let colX = 14;
+          const colWidth = 180 / headers.length;
+
+          // Headers row background
+          doc.setFillColor(241, 245, 249);
+          doc.rect(14, y - 4, 180, 7, "F");
+          doc.setFont("helvetica", "bold");
+          headers.forEach((hdr, idx) => {
+            doc.text(hdr, colX + (idx * colWidth), y);
+          });
+          y += 7;
+
+          // Rows
+          doc.setFont("helvetica", "normal");
+          rows.forEach((row) => {
+            row.forEach((cell, idx) => {
+              const cleanCell = cell.trim();
+              doc.text(cleanCell.substring(0, 24), colX + (idx * colWidth), y);
+            });
+            y += 6;
+            if (y > 275) {
+              doc.addPage();
+              y = 20;
+            }
+          });
+          y += 6;
         }
       });
+      y += 4;
     }
-    if (sections.risks && insight?.risks?.length) {
-      if (y > 250) { doc.addPage(); y = 20; }
-      doc.setFontSize(13);
+
+    // 3. Share Risks Section
+    if (sections.risks && insight?.risks && insight.risks.length > 0) {
+      if (y > 230) { doc.addPage(); y = 20; }
       doc.setFont("helvetica", "bold");
-      doc.setTextColor(37, 99, 235);
-      doc.text("III. STRATEGIC RISKS", 14, y);
-      y += 7;
-      doc.setFontSize(10);
+      doc.setFontSize(13);
+      doc.setTextColor(220, 38, 38); // red-600
+      doc.text("III. CRITICAL STRATEGIC RISKS & BLINDSPOTS", 14, y);
+      y += 8;
+
       doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
       doc.setTextColor(30, 41, 59);
-      insight.risks.forEach((r) => {
-        if (y > 270) { doc.addPage(); y = 20; }
-        const l = doc.splitTextToSize(`• ${r}`, 180);
-        doc.text(l, 14, y);
-        y += l.length * 5 + 2;
+
+      const uniqueRisks = Array.from(new Set(insight.risks));
+      uniqueRisks.forEach((risk) => {
+        const cleanRisk = risk.replace(/^[•\-\*\d\.\s]+/g, "").trim();
+        if (!cleanRisk) return;
+        const splitRisk = doc.splitTextToSize(`• ${cleanRisk}`, 180);
+        doc.text(splitRisk, 14, y);
+        y += (splitRisk.length * 5) + 3;
+        if (y > 275) { doc.addPage(); y = 20; }
       });
+      y += 6;
     }
-    if (sections.actions && insight?.actionItems?.length) {
-      if (y > 250) { doc.addPage(); y = 20; }
-      doc.setFontSize(13);
+
+    // 4. Share Dependencies Section
+    if (sections.dependencies && insight?.changingFactors && insight.changingFactors.length > 0) {
+      if (y > 230) { doc.addPage(); y = 20; }
       doc.setFont("helvetica", "bold");
-      doc.setTextColor(37, 99, 235);
-      doc.text("IV. ACTION ITEMS", 14, y);
-      y += 7;
-      doc.setFontSize(10);
+      doc.setFontSize(13);
+      doc.setTextColor(13, 148, 136); // teal-600
+      doc.text("IV. SHIFTING VARIABLES & DEPENDENCIES", 14, y);
+      y += 8;
+
       doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
       doc.setTextColor(30, 41, 59);
-      insight.actionItems.forEach((a) => {
-        if (y > 270) { doc.addPage(); y = 20; }
-        const l = doc.splitTextToSize(`[ ] ${a.task} (Owner: ${a.assignee} | ${a.priority})`, 180);
-        doc.text(l, 14, y);
-        y += l.length * 5 + 2;
+
+      const uniqueFactors = Array.from(new Set(insight.changingFactors));
+      uniqueFactors.forEach((factor) => {
+        const cleanFactor = factor.replace(/^[•\-\*\d\.\s]+/g, "").trim();
+        if (!cleanFactor) return;
+        const splitFactor = doc.splitTextToSize(`• ${cleanFactor}`, 180);
+        doc.text(splitFactor, 14, y);
+        y += (splitFactor.length * 5) + 3;
+        if (y > 275) { doc.addPage(); y = 20; }
+      });
+      y += 6;
+    }
+
+    // 5. Share Actions Items
+    if (sections.actions && insight?.actionItems && insight.actionItems.length > 0) {
+      if (y > 230) { doc.addPage(); y = 20; }
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(13);
+      doc.setTextColor(37, 99, 235); // blue-600
+      doc.text("V. DELIVERABLE ACTION ROADMAP", 14, y);
+      y += 8;
+
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+      doc.setTextColor(30, 41, 59);
+
+      const seenActions = new Set();
+      insight.actionItems.forEach((item) => {
+        if (seenActions.has(item.task)) return;
+        seenActions.add(item.task);
+
+        const itemLine = `[ ] ${item.task} (Owner: ${item.assignee} | Priority: ${item.priority})`;
+        const splitItem = doc.splitTextToSize(itemLine, 180);
+        doc.text(splitItem, 14, y);
+        y += (splitItem.length * 5) + 3.5;
+        if (y > 275) { doc.addPage(); y = 20; }
       });
     }
 
+    // 6. SWOT Section
+    if (sections.swot && insight?.swot) {
+      if (y > 230) { doc.addPage(); y = 20; }
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(13);
+      doc.setTextColor(37, 99, 235); // blue-600
+      doc.text("VI. SWOT MATRIX ANALYSIS", 14, y);
+      y += 8;
+
+      const swot = insight.swot;
+      const categories = [
+        { title: "Strengths (S)", items: swot.strengths, color: [30, 41, 59] },
+        { title: "Weaknesses (W)", items: swot.weaknesses, color: [100, 116, 139] },
+        { title: "Opportunities (O)", items: swot.opportunities, color: [5, 150, 105] },
+        { title: "Threats (T)", items: swot.threats, color: [220, 38, 38] },
+      ];
+
+      categories.forEach((cat) => {
+        if (y > 245) { doc.addPage(); y = 20; }
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(10.5);
+        doc.setTextColor(cat.color[0], cat.color[1], cat.color[2]);
+        doc.text(cat.title, 14, y);
+        y += 5;
+
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(9.5);
+        doc.setTextColor(30, 41, 59);
+        
+        cat.items.forEach((item) => {
+          const cleanItem = item.replace(/^[•\-\*\d\.\s]+/g, "").trim();
+          const splitItem = doc.splitTextToSize(`• ${cleanItem}`, 180);
+          doc.text(splitItem, 18, y);
+          y += (splitItem.length * 4.5) + 2;
+          if (y > 275) { doc.addPage(); y = 20; }
+        });
+        y += 3;
+      });
+      y += 4;
+    }
+
+    // 7. Decision Analytics Section
+    if (sections.analytics && insight?.decisionAnalytics && insight.decisionAnalytics.length > 0) {
+      if (y > 230) { doc.addPage(); y = 20; }
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(13);
+      doc.setTextColor(37, 99, 235); // blue-600
+      doc.text("VII. DECISION ANALYTICS & METRICS", 14, y);
+      y += 8;
+
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+      doc.setTextColor(30, 41, 59);
+
+      insight.decisionAnalytics.forEach((m) => {
+        const textLine = `• ${m.metric}: ${m.value} — ${m.context}`;
+        const splitText = doc.splitTextToSize(textLine, 180);
+        doc.text(splitText, 14, y);
+        y += (splitText.length * 5) + 2.5;
+        if (y > 275) { doc.addPage(); y = 20; }
+      });
+      y += 4;
+    }
+
+    // 8. Themes Section
+    if (sections.themes && insight?.themes && insight.themes.length > 0) {
+      if (y > 230) { doc.addPage(); y = 20; }
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(13);
+      doc.setTextColor(37, 99, 235); // blue-600
+      doc.text("VIII. CO-FOUNDER THEMATIC BRAINBOARD ANALYSIS", 14, y);
+      y += 8;
+
+      insight.themes.forEach((theme) => {
+        if (y > 240) { doc.addPage(); y = 20; }
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(11);
+        doc.setTextColor(71, 85, 105);
+        doc.text(`Theme: ${theme.theme}`, 14, y);
+        y += 5;
+
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(9.5);
+        doc.setTextColor(30, 41, 59);
+
+        const details = [
+          `What Was Said: ${theme.whatWasSaid}`,
+          `What It Means: ${theme.whatItMeans}`,
+          `What Could Go Wrong: ${theme.whatCouldGoWrong}`,
+          `What's Missing: ${theme.whatsMissing}`,
+        ];
+
+        details.forEach((det) => {
+          const splitDet = doc.splitTextToSize(`• ${det}`, 175);
+          doc.text(splitDet, 18, y);
+          y += (splitDet.length * 4.5) + 1.5;
+          if (y > 275) { doc.addPage(); y = 20; }
+        });
+        y += 2;
+      });
+    }
+
+    // Confidential footer branding
     doc.setFontSize(8);
     doc.setFont("helvetica", "oblique");
-    doc.setTextColor(148, 163, 184);
-    doc.text("CONFIDENTIAL — Generated by SAGE", 14, 287);
+    doc.setTextColor(148, 163, 184); // slate-400
+    doc.text("CONFIDENTIAL - FOR BOARD OF DIRECTORS ONLY • GENERATED BY SAGE INTELLECT", 14, 287);
 
     return doc;
   }
@@ -201,23 +451,74 @@ export default function ShareModal({
       return;
     }
     setSending(true);
-    try {
-      const briefingText = getBriefingText();
-      const encodedSubject = encodeURIComponent(subject);
-      const encodedBody = encodeURIComponent(briefingText);
-      const encodedTo = encodeURIComponent(recipientEmail);
+    setSentSuccess(false);
 
-      // Open provider-specific web compose in a new tab
-      let composeUrl: string;
-      if (provider === "gmail") {
-        composeUrl = `https://mail.google.com/mail/?view=cm&fs=1&to=${encodedTo}&su=${encodedSubject}&body=${encodedBody}`;
-      } else {
-        // Outlook web compose
-        composeUrl = `https://outlook.office.com/mail/deepoptions?action=compose&to=${encodedTo}&subject=${encodedSubject}&body=${encodedBody}`;
+    const briefingText = getBriefingText();
+    const htmlBody = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; color: #1e293b; background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);">
+        <div style="background-color: #0f172a; padding: 16px; border-radius: 8px 8px 0 0; text-align: center; margin: -20px -20px 20px -20px;">
+          <h2 style="color: #ffffff; margin: 0; font-size: 18px; font-weight: bold; font-family: sans-serif;">Sage Strategic Briefing</h2>
+        </div>
+        <h3 style="color: #0f172a; font-size: 16px; font-weight: bold; margin-top: 0;">Subject: ${subject}</h3>
+        <div style="white-space: pre-wrap; font-size: 13px; line-height: 1.6; color: #334155; font-family: monospace; background-color: #f8fafc; padding: 16px; border-radius: 8px; border: 1px solid #f1f5f9;">${briefingText}</div>
+        <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
+        <p style="font-size: 11px; color: #94a3b8; font-style: italic; text-align: center; margin: 0;">
+          CONFIDENTIAL & PRIVILEGED &mdash; Generated by SAGE Executive Intellect
+        </p>
+      </div>
+    `;
+
+    try {
+      const resendKey = "re_3xUWt6YR_Afje9PpVXqLeBT6yCfXYXJ4G";
+
+      const res = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${resendKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: "Sage Collaborator <onboarding@resend.dev>",
+          to: recipientEmail.split(",").map(e => e.trim()),
+          subject: subject,
+          html: htmlBody,
+        }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`Resend API returned status ${res.status}`);
       }
-      window.open(composeUrl, "_blank", "noopener,noreferrer");
 
       try {
+        await supabase.from("email_logs").insert({
+          notebook_id: notebook!.id,
+          recipient: recipientEmail,
+          subject,
+          provider: "resend",
+          sections_shared: sections,
+        });
+      } catch (dbErr) {
+        console.warn("Failed to log email to Supabase:", dbErr);
+      }
+
+      setSentSuccess(true);
+      toast.success("Briefing sent successfully!");
+    } catch (err: any) {
+      console.warn("Direct Resend email dispatch failed (e.g. CORS block). Falling back to client ecosystem compose tab...", err);
+
+      try {
+        const encodedSubject = encodeURIComponent(subject);
+        const encodedBody = encodeURIComponent(briefingText);
+        const encodedTo = encodeURIComponent(recipientEmail);
+
+        let composeUrl: string;
+        if (provider === "gmail") {
+          composeUrl = `https://mail.google.com/mail/?view=cm&fs=1&to=${encodedTo}&su=${encodedSubject}&body=${encodedBody}`;
+        } else {
+          composeUrl = `https://outlook.office.com/mail/deepoptions?action=compose&to=${encodedTo}&subject=${encodedSubject}&body=${encodedBody}`;
+        }
+        window.open(composeUrl, "_blank", "noopener,noreferrer");
+
         await supabase.from("email_logs").insert({
           notebook_id: notebook!.id,
           recipient: recipientEmail,
@@ -225,14 +526,12 @@ export default function ShareModal({
           provider,
           sections_shared: sections,
         });
-      } catch {
-        // Logging failure shouldn't block the user flow
-      }
 
-      setSentSuccess(true);
-      toast.success(`${provider === "gmail" ? "Gmail" : "Outlook"} compose opened in a new tab`);
-    } catch (err: any) {
-      toast.error(err.message || "Failed to send briefing");
+        setSentSuccess(true);
+        toast.success(`Compose tab opened in new window via ${provider === "gmail" ? "Gmail" : "Outlook"}`);
+      } catch (fallbackErr: any) {
+        toast.error(fallbackErr.message || "Failed to initiate email compose");
+      }
     } finally {
       setSending(false);
     }
