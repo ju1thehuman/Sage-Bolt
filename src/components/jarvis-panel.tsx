@@ -138,7 +138,6 @@ Return JSON with these fields:
 
       // 2. If Edge Function failed or returned a fallback mock (fallbackActive === true), AND we have a client key
       if ((!data || data.fallbackActive) && clientGeminiKey) {
-        console.log("Edge Function unavailable or on fallback. Running client-side analysis...");
         data = await callGeminiClientSide(notesContent, clientGeminiKey);
         usedClientSide = true;
       }

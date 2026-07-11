@@ -23,3 +23,13 @@ dist-ssr
 *.sln
 *.sw?
 .env
+
+# Local Chrome debug profile (QA / Playwright)
+.chrome-debug-profile/
+
+# QA / local test artifacts
+test-*.js
+*_screenshot*.png
+collapsed_text.png
+expanded_text.png
+typing_indicator.png

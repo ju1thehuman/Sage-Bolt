@@ -59,16 +59,26 @@ function getIndentLevel(line: string): number {
   return match ? Math.floor(match[1].length / 2) : 0;
 }
 
+interface ActiveUserPresence {
+  profile: Profile;
+  isTyping?: boolean;
+  typingBlockId?: string | null;
+  tabId?: string;
+}
+
 export default function NotebookPage() {
   const { notebookId } = useParams<{ notebookId: string }>();
   const { user, profile } = useAuth();
   const navigate = useNavigate();
+  const tabIdRef = useRef<string>(crypto.randomUUID());
+  const myTabId = tabIdRef.current;
 
   const [notebook, setNotebook] = useState<Notebook | null>(null);
   const [blocks, setBlocks] = useState<NoteBlock[]>([]);
   const [collaborators, setCollaborators] = useState<Collaborator[]>([]);
   const [ownerProfile, setOwnerProfile] = useState<Profile | null>(null);
   const [activeUsers, setActiveUsers] = useState<Profile[]>([]);
+  const [activePresences, setActivePresences] = useState<ActiveUserPresence[]>([]);
   const [notebooks, setNotebooks] = useState<Notebook[]>([]);
   const [loading, setLoading] = useState(true);
   const [shareOpen, setShareOpen] = useState(false);
@@ -76,6 +86,40 @@ export default function NotebookPage() {
   const [insight, setInsight] = useState<JarvisInsight | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [blockAuthors, setBlockAuthors] = useState<Map<string, Profile>>(new Map());
+
+  const presenceChannelRef = useRef<any>(null);
+  const isTypingRef = useRef<{ blockId: string | null }>({ blockId: null });
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const locallyCreatedBlockIdsRef = useRef<Set<string>>(new Set());
+
+  const handleTyping = useCallback((blockId: string | null) => {
+    if (!presenceChannelRef.current || !profile) return;
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+
+    if (isTypingRef.current.blockId !== blockId) {
+      isTypingRef.current.blockId = blockId;
+      presenceChannelRef.current.track({
+        profile,
+        isTyping: !!blockId,
+        typingBlockId: blockId,
+        tabId: myTabId,
+      });
+    }
+
+    if (blockId) {
+      typingTimeoutRef.current = setTimeout(() => {
+        isTypingRef.current.blockId = null;
+        presenceChannelRef.current?.track({
+          profile,
+          isTyping: false,
+          typingBlockId: null,
+          tabId: myTabId,
+        });
+      }, 3000);
+    }
+  }, [profile, myTabId]);
+
+
 
   // Sidebar state
   const [showInviteForm, setShowInviteForm] = useState(false);
@@ -197,28 +241,86 @@ export default function NotebookPage() {
 
     // Presence
     const presenceChannel = supabase.channel(`presence:notebook_${notebookId}`, {
-      config: { presence: { key: profile.id } }
+      config: { presence: { key: myTabId } }
     });
+    presenceChannelRef.current = presenceChannel;
 
     presenceChannel
       .on("presence", { event: "sync" }, () => {
         const state = presenceChannel.presenceState();
-        const profiles: Profile[] = [];
+        
+        // Group and keep only the latest presence payload for each unique tabId
+        const latestPresences = new Map<string, any>();
         for (const id in state) {
-          const userState = state[id][0] as any;
-          if (userState?.profile) profiles.push(userState.profile);
+          state[id].forEach((userState: any) => {
+            if (userState?.profile && userState.tabId) {
+              latestPresences.set(userState.tabId, userState);
+            }
+          });
         }
+
+        const profiles: Profile[] = [];
+        const presences: ActiveUserPresence[] = [];
+        
+        latestPresences.forEach((userState) => {
+          if (!profiles.some(p => p.id === userState.profile.id)) {
+            profiles.push(userState.profile);
+          }
+          presences.push({
+            profile: userState.profile,
+            isTyping: userState.isTyping,
+            typingBlockId: userState.typingBlockId,
+            tabId: userState.tabId,
+          });
+        });
+
         setActiveUsers(profiles);
+        setActivePresences(presences);
+      })
+      .on("broadcast", { event: "block-changed" }, ({ payload }) => {
+        if (payload.senderTabId === myTabId) return;
+
+        if (payload.type === "insert") {
+          setBlocks((prev) => {
+            if (prev.some((b) => b.id === payload.block.id)) return prev;
+            const updatedList = [...prev, payload.block];
+            return updatedList.sort((a, b) => a.position - b.position);
+          });
+          const authorId = payload.block.user_id;
+          if (authorId) {
+            supabase
+              .from("profiles")
+              .select("*")
+              .eq("id", authorId)
+              .single()
+              .then(({ data: profileData }) => {
+                if (profileData) {
+                  setBlockAuthors((prev) => {
+                    const next = new Map(prev);
+                    next.set(authorId, profileData);
+                    return next;
+                  });
+                }
+              });
+          }
+        } else if (payload.type === "update") {
+          setBlocks((prev) =>
+            prev.map((b) => (b.id === payload.blockId ? { ...b, ...payload.updates } : b))
+          );
+        } else if (payload.type === "delete") {
+          setBlocks((prev) => prev.filter((b) => b.id !== payload.blockId));
+        }
       })
       .subscribe(async (status) => {
         if (status === "SUBSCRIBED") {
-          await presenceChannel.track({ profile });
+          await presenceChannel.track({ profile, tabId: myTabId });
         }
       });
 
     return () => {
       supabase.removeChannel(blockChannel);
       supabase.removeChannel(presenceChannel);
+      presenceChannelRef.current = null;
     };
   }, [notebookId, profile]);
 
@@ -255,7 +357,16 @@ export default function NotebookPage() {
     const { data, error } = await supabase
       .from("note_blocks").insert(newBlock).select().maybeSingle();
     if (error) { toast.error("Failed to add block"); return; }
+    if (data) {
+      locallyCreatedBlockIdsRef.current.add(data.id);
+    }
     setBlocks([...blocks, data as NoteBlock]);
+
+    presenceChannelRef.current?.send({
+      type: "broadcast",
+      event: "block-changed",
+      payload: { type: "insert", block: data, senderTabId: myTabId }
+    });
   }
 
   async function updateBlock(id: string, updates: Partial<NoteBlock>) {
@@ -267,11 +378,24 @@ export default function NotebookPage() {
     if (poll_data !== undefined) dbUpdates.poll_data = poll_data;
     if (bullet_style !== undefined) dbUpdates.bullet_style = bullet_style;
     await supabase.from("note_blocks").update(dbUpdates).eq("id", id);
+
+    presenceChannelRef.current?.send({
+      type: "broadcast",
+      event: "block-changed",
+      payload: { type: "update", blockId: id, updates, senderTabId: myTabId }
+    });
   }
 
   async function deleteBlock(id: string) {
+    handleTyping(null);
     setBlocks((prev) => prev.filter((b) => b.id !== id));
     await supabase.from("note_blocks").delete().eq("id", id);
+
+    presenceChannelRef.current?.send({
+      type: "broadcast",
+      event: "block-changed",
+      payload: { type: "delete", blockId: id, senderTabId: myTabId }
+    });
   }
 
   async function inviteCollaborator() {
@@ -428,9 +552,21 @@ export default function NotebookPage() {
                   <button
                     onClick={async (e) => {
                       e.stopPropagation();
-                      if (!confirm("Delete this workspace?")) return;
-                      await supabase.from("notebooks").delete().eq("id", nb.id);
-                      navigate("/");
+                      if (!confirm(`Delete "${nb.title}"? This cannot be undone.`)) return;
+                      const isActive = nb.id === notebookId;
+                      // Remove from sidebar immediately
+                      setNotebooks((prev) => prev.filter((n) => n.id !== nb.id));
+                      const { error } = await supabase.from("notebooks").delete().eq("id", nb.id);
+                      if (error) {
+                        toast.error("Failed to delete workspace");
+                        // Reload list to restore on error
+                        const { data } = await supabase.from("notebooks").select("*").order("last_updated", { ascending: false });
+                        setNotebooks((data as any[]) || []);
+                      } else {
+                        toast.success("Workspace deleted");
+                        // Only navigate away if user deleted the current workspace
+                        if (isActive) navigate("/");
+                      }
                     }}
                     className="opacity-0 group-hover:opacity-100 hover:text-rose-600 transition ml-1 shrink-0"
                   >
@@ -719,18 +855,27 @@ export default function NotebookPage() {
                 </div>
               )}
 
-              {blocks.map((block) => (
-                <BlockEditor
-                  key={block.id}
-                  block={block}
-                  userId={user!.id}
-                  authorName={blockAuthors.get(block.user_id)?.display_name || profile?.display_name || "Unknown"}
-                  authorInitials={blockAuthors.get(block.user_id)?.avatar_initials || "?"}
-                  onUpdate={(updates) => updateBlock(block.id, updates)}
-                  onDelete={() => deleteBlock(block.id)}
-                  onVote={(optionId) => voteOnPoll(block.id, optionId)}
-                />
-              ))}
+              {blocks.map((block) => {
+                const typingUsers = activePresences.filter(
+                  (ap) => ap.isTyping && ap.typingBlockId === block.id && !(ap.profile.id === user?.id && ap.tabId === myTabId)
+                ).map((ap) => ap.profile);
+
+                return (
+                  <BlockEditor
+                    key={block.id}
+                    block={block}
+                    userId={user!.id}
+                    authorName={blockAuthors.get(block.user_id)?.display_name || "Unknown"}
+                    authorInitials={blockAuthors.get(block.user_id)?.avatar_initials || "?"}
+                    onUpdate={(updates) => updateBlock(block.id, updates)}
+                    onDelete={() => deleteBlock(block.id)}
+                    onVote={(optionId) => voteOnPoll(block.id, optionId)}
+                    onTyping={handleTyping}
+                    typingUsers={typingUsers}
+                    isLocallyCreated={locallyCreatedBlockIdsRef.current.has(block.id)}
+                  />
+                );
+              })}
 
               {/* End placeholder */}
               {blocks.length > 0 && (
@@ -794,10 +939,195 @@ export default function NotebookPage() {
 }
 
 // ============================================================================
+// Markdown Renderer
+// ============================================================================
+function MarkdownRenderer({ content, fontSizeClass, bold, italic }: { content: string; fontSizeClass: string; bold?: boolean; italic?: boolean }) {
+  if (!content?.trim()) {
+    return <span className="text-slate-400 italic">Empty text block</span>;
+  }
+
+  const lines = content.split("\n");
+  const parsedElements: React.ReactNode[] = [];
+  
+  let currentListItems: string[] = [];
+  let inList = false;
+
+  let currentTableRows: string[][] = [];
+  let inTable = false;
+
+  let currentCodeBlock: string[] = [];
+  let inCodeBlock = false;
+
+  const renderInline = (text: string) => {
+    let parts: React.ReactNode[] = [text];
+    
+    // Bold: **text**
+    parts = parts.flatMap(part => {
+      if (typeof part !== "string") return part;
+      const subparts = part.split(/\*\*([^*]+)\*\*/g);
+      return subparts.map((sub, idx) => idx % 2 === 1 ? <strong key={`b-${idx}`} className="font-bold">{sub}</strong> : sub);
+    });
+
+    // Italic: *text*
+    parts = parts.flatMap(part => {
+      if (typeof part !== "string") return part;
+      const subparts = part.split(/\*([^*]+)\*/g);
+      return subparts.map((sub, idx) => idx % 2 === 1 ? <em key={`i-${idx}`} className="italic">{sub}</em> : sub);
+    });
+
+    // Inline Code: `code`
+    parts = parts.flatMap(part => {
+      if (typeof part !== "string") return part;
+      const subparts = part.split(/`([^`]+)`/g);
+      return subparts.map((sub, idx) => idx % 2 === 1 ? <code key={`c-${idx}`} className="bg-slate-100 text-slate-800 px-1 py-0.5 rounded font-mono text-xs">{sub}</code> : sub);
+    });
+
+    return parts;
+  };
+
+  const flushList = (key: string) => {
+    if (currentListItems.length > 0) {
+      parsedElements.push(
+        <ul key={`ul-${key}`} className="list-disc pl-5 my-1.5 space-y-0.5">
+          {currentListItems.map((item, idx) => (
+            <li key={`li-${idx}`}>{renderInline(item)}</li>
+          ))}
+        </ul>
+      );
+      currentListItems = [];
+      inList = false;
+    }
+  };
+
+  const flushTable = (key: string) => {
+    if (currentTableRows.length > 0) {
+      const headers = currentTableRows[0];
+      const rows = currentTableRows.slice(1).filter(row => !row.every(cell => cell.trim().startsWith("-")));
+      parsedElements.push(
+        <div key={`table-${key}`} className="my-3 overflow-x-auto border border-slate-200 rounded-lg shadow-2xs">
+          <table className="min-w-full divide-y divide-slate-200 text-xs">
+            <thead className="bg-slate-50 text-slate-700 font-bold">
+              <tr>
+                {headers.map((h, idx) => (
+                  <th key={`th-${idx}`} className="px-3 py-2 text-left border-b border-slate-200">{renderInline(h.trim())}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="bg-white divide-y divide-slate-100 text-slate-600">
+              {rows.map((row, rIdx) => (
+                <tr key={`tr-${rIdx}`} className="hover:bg-slate-50/50">
+                  {row.map((cell, cIdx) => (
+                    <td key={`td-${cIdx}`} className="px-3 py-2 border-r border-slate-100 last:border-r-0">{renderInline(cell.trim())}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+      currentTableRows = [];
+      inTable = false;
+    }
+  };
+
+  const flushCodeBlock = (key: string) => {
+    if (currentCodeBlock.length > 0) {
+      parsedElements.push(
+        <pre key={`code-${key}`} className="bg-slate-800 text-slate-100 p-3 rounded-lg border font-mono text-xs my-2 overflow-x-auto">
+          <code>{currentCodeBlock.join("\n")}</code>
+        </pre>
+      );
+      currentCodeBlock = [];
+      inCodeBlock = false;
+    }
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith("```")) {
+      if (inCodeBlock) {
+        flushCodeBlock(String(i));
+      } else {
+        flushList(String(i));
+        flushTable(String(i));
+        inCodeBlock = true;
+      }
+      continue;
+    }
+
+    if (inCodeBlock) {
+      currentCodeBlock.push(line);
+      continue;
+    }
+
+    if (trimmed.startsWith("|") && trimmed.endsWith("|")) {
+      flushList(String(i));
+      const cells = trimmed.split("|").slice(1, -1);
+      currentTableRows.push(cells);
+      inTable = true;
+      continue;
+    } else if (inTable) {
+      flushTable(String(i));
+    }
+
+    if (trimmed.startsWith("- ") || trimmed.startsWith("* ") || trimmed.startsWith("• ")) {
+      inList = true;
+      currentListItems.push(trimmed.slice(2));
+      continue;
+    } else if (inList) {
+      flushList(String(i));
+    }
+
+    if (trimmed.startsWith("# ")) {
+      parsedElements.push(<h1 key={`h1-${i}`} className="text-xl font-bold text-slate-800 mt-2.5 mb-1.5 border-b pb-1">{renderInline(trimmed.slice(2))}</h1>);
+      continue;
+    }
+    if (trimmed.startsWith("## ")) {
+      parsedElements.push(<h2 key={`h2-${i}`} className="text-lg font-bold text-slate-800 mt-2 mb-1">{renderInline(trimmed.slice(3))}</h2>);
+      continue;
+    }
+    if (trimmed.startsWith("### ")) {
+      parsedElements.push(<h3 key={`h3-${i}`} className="text-base font-bold text-slate-800 mt-1.5 mb-0.5">{renderInline(trimmed.slice(4))}</h3>);
+      continue;
+    }
+
+    if (trimmed === "") {
+      parsedElements.push(<div key={`empty-${i}`} className="h-2" />);
+    } else {
+      parsedElements.push(<p key={`p-${i}`} className="leading-relaxed my-0.5">{renderInline(line)}</p>);
+    }
+  }
+
+  flushList("end");
+  flushTable("end");
+  flushCodeBlock("end");
+
+  return (
+    <div className={`${fontSizeClass} ${bold ? "font-bold" : ""} ${italic ? "italic" : ""} space-y-1`}>
+      {parsedElements}
+    </div>
+  );
+}
+
+const getTypingIndicatorText = (users: Profile[]) => {
+  if (users.length === 0) return "";
+  if (users.length === 1) {
+    return `${users[0].display_name} is typing...`;
+  }
+  if (users.length === 2) {
+    return `${users[0].display_name} & ${users[1].display_name} are typing...`;
+  }
+  const firstNames = users.slice(0, -1).map(u => u.display_name).join(", ");
+  return `${firstNames} & ${users[users.length - 1].display_name} are typing...`;
+};
+
+// ============================================================================
 // Block Editor
 // ============================================================================
 function BlockEditor({
-  block, userId, authorName, authorInitials, onUpdate, onDelete, onVote,
+  block, userId, authorName, authorInitials, onUpdate, onDelete, onVote, onTyping, typingUsers, isLocallyCreated,
 }: {
   block: NoteBlock;
   userId: string;
@@ -806,14 +1136,46 @@ function BlockEditor({
   onUpdate: (updates: Partial<NoteBlock>) => void;
   onDelete: () => void;
   onVote: (optionId: string) => void;
+  onTyping: (blockId: string | null) => void;
+  typingUsers?: Profile[];
+  isLocallyCreated?: boolean;
 }) {
-  const [isEditing, setIsEditing] = useState(false);
-  const fontSizeClass = FONT_SIZES[block.font_size] || "text-base";
   const isOwner = block.user_id === userId;
+  const [isEditing, setIsEditing] = useState(() => {
+    if (!isOwner) return false;
+    if (isLocallyCreated) {
+      if (block.type === "text" && !block.content?.trim()) return true;
+      if (block.type === "bullets" && !block.content?.trim()) return true;
+      if (block.type === "table") {
+        const table = block.table_data;
+        return !table || table.rows.every(r => r.every(c => !c.trim()));
+      }
+      if (block.type === "poll") {
+        const poll = block.poll_data;
+        return !poll || (!poll.question.trim() && poll.options.every(o => !o.text.trim()));
+      }
+    }
+    return false;
+  });
+  const [expanded, setExpanded] = useState(false);
+  const fontSizeClass = FONT_SIZES[block.font_size] || "text-base";
   const highlightWrap = getHighlightWrapClass(block.highlight_color);
 
-  // Prevent empty text blocks from rendering for non-owners
-  if (block.type === "text" && !block.content?.trim() && !isOwner) {
+  // Local caching states for WhatsApp-style sync
+  const [localContent, setLocalContent] = useState(block.content || "");
+  const [localTableData, setLocalTableData] = useState(block.table_data);
+  const [localPollData, setLocalPollData] = useState(block.poll_data);
+
+  useEffect(() => {
+    if (!isEditing) {
+      setLocalContent(block.content || "");
+      setLocalTableData(block.table_data);
+      setLocalPollData(block.poll_data);
+    }
+  }, [block.content, block.table_data, block.poll_data, isEditing]);
+
+  // Prevent empty text blocks from rendering for non-owners — UNLESS someone is actively typing in it
+  if (block.type === "text" && !block.content?.trim() && !isOwner && (!typingUsers || typingUsers.length === 0)) {
     return null;
   }
 
@@ -914,7 +1276,13 @@ function BlockEditor({
                 <Trash2 className="w-3.5 h-3.5" />
               </button>
               <button
-                onClick={() => setIsEditing(false)}
+                onClick={() => {
+                  setIsEditing(false);
+                  onTyping(null);
+                  if (block.type === "text" && localContent !== block.content) {
+                    onUpdate({ content: localContent });
+                  }
+                }}
                 className="bg-emerald-600 hover:bg-emerald-700 text-white text-3xs font-bold uppercase font-mono px-2 py-1 rounded shadow-xs flex items-center gap-1 cursor-pointer"
               >
                 <Check className="w-3 h-3" /> Done
@@ -926,25 +1294,110 @@ function BlockEditor({
         {/* Content */}
         {block.type === "bullets" ? (
           <BulletEditor
-            content={block.content}
+            content={localContent}
             bulletStyle={block.bullet_style || "dot"}
             readOnly={!isOwner}
-            onChange={(content) => onUpdate({ content })}
-            onEditEnter={() => setIsEditing(true)}
+            onChange={(content) => {
+              setLocalContent(content);
+              onTyping(block.id);
+            }}
+            onEditEnter={() => {
+              setIsEditing(true);
+              onTyping(block.id);
+            }}
             onDelete={onDelete}
             isEditing={isEditing}
-            setIsEditing={setIsEditing}
+            setIsEditing={(val) => {
+              setIsEditing(val);
+              if (!val) {
+                onTyping(null);
+                onUpdate({ content: localContent });
+              }
+            }}
           />
+        ) : !isEditing ? (
+          <div
+            onClick={() => {
+              if (isOwner) {
+                setIsEditing(true);
+                onTyping(block.id);
+              }
+            }}
+            className={`w-full ${!isOwner ? "cursor-default" : "cursor-pointer"}`}
+          >
+            {(() => {
+              const lines = (localContent || "").split("\n");
+              const hasMoreThan10Lines = lines.length > 10;
+              const displayedContent = (hasMoreThan10Lines && !expanded)
+                ? lines.slice(0, 10).join("\n")
+                : localContent;
+              return (
+                <>
+                  <MarkdownRenderer
+                    content={displayedContent}
+                    fontSizeClass={fontSizeClass}
+                    bold={block.bold}
+                    italic={block.italic}
+                  />
+                  {hasMoreThan10Lines && (
+                    <div className="mt-2">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setExpanded(!expanded);
+                        }}
+                        className="text-xs font-bold text-blue-600 hover:text-blue-700 transition cursor-pointer"
+                      >
+                        {expanded ? "Read Less" : "... Read More"}
+                      </button>
+                    </div>
+                  )}
+                </>
+              );
+            })()}
+          </div>
         ) : (
           <textarea
             autoFocus={isOwner && !block.content}
-            value={block.content}
-            onChange={(e) => onUpdate({ content: e.target.value })}
-            onFocus={() => isOwner && setIsEditing(true)}
+            value={localContent}
+            onChange={(e) => {
+              setLocalContent(e.target.value);
+              onTyping(block.id);
+            }}
+            onPaste={(e) => {
+              const text = e.clipboardData.getData("text");
+              const lines = text.split("\n");
+              const isMarkdownList = lines.some(line => {
+                const trimmed = line.trim();
+                return trimmed.startsWith("- ") || trimmed.startsWith("* ") || trimmed.startsWith("• ") || /^\d+\.\s/.test(trimmed);
+              });
+              if (isMarkdownList) {
+                e.preventDefault();
+                const parsedContent = lines
+                  .map((line) => line.replace(/^(\s*[-*•]|\s*\d+\.)\s*/, ""))
+                  .filter((line) => line.trim() !== "")
+                  .join("\n");
+                setIsEditing(false);
+                onTyping(null);
+                onUpdate({
+                  type: "bullets",
+                  content: parsedContent,
+                });
+              }
+            }}
+            onFocus={() => {
+              if (isOwner) {
+                setIsEditing(true);
+                onTyping(block.id);
+              }
+            }}
             onBlur={(e) => {
               setIsEditing(false);
+              onTyping(null);
               if (isOwner && !e.target.value.trim()) {
                 onDelete();
+              } else if (isOwner && e.target.value !== block.content) {
+                onUpdate({ content: e.target.value });
               }
             }}
             readOnly={!isOwner}
@@ -957,7 +1410,10 @@ function BlockEditor({
         {!isEditing && isOwner && block.type === "text" && (
           <div className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition duration-150 flex gap-1">
             <button
-              onClick={() => setIsEditing(true)}
+              onClick={() => {
+                setIsEditing(true);
+                onTyping(block.id);
+              }}
               className="p-1.5 rounded-lg hover:bg-blue-50 hover:text-blue-600 text-slate-400 transition"
             >
               <Users className="w-3.5 h-3.5" />
@@ -976,6 +1432,13 @@ function BlockEditor({
             </button>
           </div>
         )}
+
+        {typingUsers && typingUsers.length > 0 && (
+          <div className="text-[10px] text-blue-600 font-semibold font-sans flex items-center gap-1 mt-1.5 select-none animate-pulse">
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-blue-500 animate-ping mr-1"></span>
+            <span className="italic">{getTypingIndicatorText(typingUsers)}</span>
+          </div>
+        )}
       </div>
     );
   }
@@ -991,49 +1454,96 @@ function BlockEditor({
           <TableIcon className="w-3.5 h-3.5 text-amber-500" /> Table Block
           {!isOwner && <span className="text-[9px] bg-slate-100 px-1.5 py-0.5 rounded normal-case tracking-normal">Read-only</span>}
           {isOwner && (
-            <button
-              onClick={onDelete}
-              className="ml-auto p-1.5 rounded-lg hover:bg-rose-50 hover:text-rose-600 text-slate-400 transition"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-            </button>
+            <div className="ml-auto flex items-center gap-1">
+              <button
+                onClick={() => {
+                  if (isEditing) {
+                    const isEmpty = localTableData.rows.every(r => r.every(c => !c.trim()));
+                    if (isEmpty) {
+                      onDelete();
+                      onTyping(null);
+                      return;
+                    }
+                    onUpdate({ table_data: localTableData });
+                  }
+                  setIsEditing(!isEditing);
+                  if (isEditing) {
+                    onTyping(null);
+                  } else {
+                    onTyping(block.id);
+                  }
+                }}
+                className={`px-2 py-0.5 rounded text-[9px] font-mono uppercase tracking-wider transition ${
+                  isEditing
+                    ? "bg-emerald-100 text-emerald-700 border border-emerald-200"
+                    : "bg-slate-100 text-slate-500 border border-slate-200 hover:bg-slate-200"
+                }`}
+              >
+                {isEditing ? "Done" : "Edit"}
+              </button>
+              <button
+                onClick={() => {
+                  onDelete();
+                  onTyping(null);
+                }}
+                className="p-1.5 rounded-lg hover:bg-rose-50 hover:text-rose-600 text-slate-400 transition"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            </div>
           )}
         </div>
         <div className="overflow-x-auto rounded-lg border border-slate-200">
           <table className="min-w-full border-collapse">
             <thead>
               <tr className="bg-slate-100 border-b-2 border-slate-200">
-                {table.headers.map((header, i) => (
+                {localTableData.headers.map((header, i) => (
                   <th key={i} className="px-3 py-2 text-left border-r border-slate-200 last:border-r-0">
-                    <input
-                      value={header}
-                      readOnly={!isOwner}
-                      onChange={(e) => {
-                        const headers = [...table.headers];
-                        headers[i] = e.target.value;
-                        onUpdate({ table_data: { ...table, headers } });
-                      }}
-                      className={`w-full bg-transparent border-none ${isOwner ? "focus:outline-none focus:border-blue-500" : "cursor-default"} text-xs font-bold text-slate-700 uppercase tracking-wider font-mono`}
-                    />
+                    {isEditing && isOwner ? (
+                      <input
+                        value={header}
+                        onChange={(e) => {
+                          const headers = [...localTableData.headers];
+                          headers[i] = e.target.value;
+                          setLocalTableData({ ...localTableData, headers });
+                          onTyping(block.id);
+                        }}
+                        onFocus={() => onTyping(block.id)}
+                        onBlur={() => onTyping(null)}
+                        className="w-full bg-transparent border-none focus:outline-none focus:border-blue-500 text-xs font-bold text-slate-700 uppercase tracking-wider font-mono"
+                      />
+                    ) : (
+                      <span className="text-xs font-bold text-slate-700 uppercase tracking-wider font-mono block min-h-[16px]">
+                        {header || `Column ${i + 1}`}
+                      </span>
+                    )}
                   </th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {table.rows.map((row, ri) => (
+              {localTableData.rows.map((row, ri) => (
                 <tr key={ri} className="border-b border-slate-200 last:border-b-0 hover:bg-slate-50/50">
                   {row.map((cell, ci) => (
                     <td key={ci} className="px-3 py-2 border-r border-slate-200 last:border-r-0">
-                      <input
-                        value={cell}
-                        readOnly={!isOwner}
-                        onChange={(e) => {
-                          const rows = table.rows.map((r) => [...r]);
-                          rows[ri][ci] = e.target.value;
-                          onUpdate({ table_data: { ...table, rows } });
-                        }}
-                        className={`w-full bg-transparent border-none ${isOwner ? "focus:outline-none focus:text-blue-600" : "cursor-default"} text-sm text-slate-700`}
-                      />
+                      {isEditing && isOwner ? (
+                        <input
+                          value={cell}
+                          onChange={(e) => {
+                            const rows = localTableData.rows.map((r) => [...r]);
+                            rows[ri][ci] = e.target.value;
+                            setLocalTableData({ ...localTableData, rows });
+                            onTyping(block.id);
+                          }}
+                          onFocus={() => onTyping(block.id)}
+                          onBlur={() => onTyping(null)}
+                          className="w-full bg-transparent border-none focus:outline-none focus:text-blue-600 text-sm text-slate-700"
+                        />
+                      ) : (
+                        <span className="text-sm text-slate-700 block min-h-[20px]">
+                          {cell || <span className="text-slate-300 italic text-xs">Empty</span>}
+                        </span>
+                      )}
                     </td>
                   ))}
                 </tr>
@@ -1041,33 +1551,41 @@ function BlockEditor({
             </tbody>
           </table>
         </div>
-        {isOwner && (
+        {isEditing && isOwner && (
           <div className="flex items-center gap-2 mt-2">
             <button
               onClick={() => {
                 const newTable: TableData = {
-                  ...table,
-                  rows: [...table.rows, table.headers.map(() => "")],
+                  ...localTableData,
+                  rows: [...localTableData.rows, localTableData.headers.map(() => "")],
                 };
-                onUpdate({ table_data: newTable });
+                setLocalTableData(newTable);
+                onTyping(block.id);
               }}
-              className="text-[10px] font-mono bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md px-2 py-1 transition"
+              className="text-[10px] font-mono bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md px-2 py-1 transition cursor-pointer"
             >
               + Add Row
             </button>
             <button
               onClick={() => {
                 const newTable: TableData = {
-                  ...table,
-                  headers: [...table.headers, `Column ${table.headers.length + 1}`],
-                  rows: table.rows.map((r) => [...r, ""]),
+                  ...localTableData,
+                  headers: [...localTableData.headers, `Column ${localTableData.headers.length + 1}`],
+                  rows: localTableData.rows.map((r) => [...r, ""]),
                 };
-                onUpdate({ table_data: newTable });
+                setLocalTableData(newTable);
+                onTyping(block.id);
               }}
-              className="text-[10px] font-mono bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md px-2 py-1 transition"
+              className="text-[10px] font-mono bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md px-2 py-1 transition cursor-pointer"
             >
               + Add Column
             </button>
+          </div>
+        )}
+        {typingUsers && typingUsers.length > 0 && (
+          <div className="text-[10px] text-blue-600 font-semibold font-sans flex items-center gap-1 mt-1.5 select-none animate-pulse">
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-blue-500 animate-ping mr-1"></span>
+            <span className="italic">{getTypingIndicatorText(typingUsers)}</span>
           </div>
         )}
       </div>
@@ -1086,6 +1604,9 @@ function BlockEditor({
         onUpdate={onUpdate}
         onDelete={onDelete}
         onVote={onVote}
+        onTyping={onTyping}
+        typingUsers={typingUsers}
+        blockId={block.id}
       />
     );
   }
@@ -1249,7 +1770,14 @@ function BulletEditor({
           <div className="flex items-center gap-2 pt-2 border-t border-slate-100 mt-2">
             <span className="text-[9px] font-mono text-slate-400">Tab = indent • Shift+Tab = outdent • Enter = new line</span>
             <button
-              onClick={() => setIsEditing(false)}
+              onClick={() => {
+                const isEmpty = localLines.every(line => !line.trim());
+                if (isEmpty) {
+                  onDelete();
+                } else {
+                  setIsEditing(false);
+                }
+              }}
               className="ml-auto bg-emerald-600 hover:bg-emerald-700 text-white text-3xs font-bold uppercase font-mono px-2 py-1 rounded shadow-xs flex items-center gap-1 cursor-pointer"
             >
               <Check className="w-3 h-3" /> Done
@@ -1271,7 +1799,7 @@ function BulletEditor({
 // PollBlock — edit mode toggle hides option inputs until owner clicks "Edit"
 // ============================================================================
 function PollBlock({
-  poll, isOwner, userId, onUpdate, onDelete, onVote,
+  poll, isOwner, userId, onUpdate, onDelete, onVote, onTyping, typingUsers, blockId,
 }: {
   poll: PollData;
   isOwner: boolean;
@@ -1279,8 +1807,22 @@ function PollBlock({
   onUpdate: (updates: Partial<NoteBlock>) => void;
   onDelete: () => void;
   onVote: (optionId: string) => void;
+  onTyping: (blockId: string | null) => void;
+  typingUsers?: Profile[];
+  blockId: string;
 }) {
-  const [isEditing, setIsEditing] = useState(false);
+  const [isEditing, setIsEditing] = useState(() => {
+    if (!isOwner) return false;
+    return !poll.question.trim();
+  });
+  const [localPoll, setLocalPoll] = useState(poll);
+
+  useEffect(() => {
+    if (!isEditing) {
+      setLocalPoll(poll);
+    }
+  }, [poll, isEditing]);
+
   const hasVoted = poll.voted_user_ids.includes(userId);
   const totalVotes = poll.options.reduce((sum, o) => sum + o.votes, 0);
 
@@ -1292,7 +1834,24 @@ function PollBlock({
         {isOwner && (
           <div className="ml-auto flex items-center gap-1">
             <button
-              onClick={() => setIsEditing(!isEditing)}
+              onClick={() => {
+                if (isEditing) {
+                  const isQuestionEmpty = !localPoll.question.trim();
+                  const areOptionsEmpty = localPoll.options.every(o => !o.text.trim() || o.text === "Option 1" || o.text === "Option 2");
+                  if (isQuestionEmpty && areOptionsEmpty) {
+                    onDelete();
+                    onTyping(null);
+                    return;
+                  }
+                  onUpdate({ poll_data: localPoll });
+                }
+                setIsEditing(!isEditing);
+                if (isEditing) {
+                  onTyping(null);
+                } else {
+                  onTyping(blockId);
+                }
+              }}
               className={`px-2 py-0.5 rounded text-[9px] font-mono uppercase tracking-wider transition ${
                 isEditing
                   ? "bg-emerald-100 text-emerald-700 border border-emerald-200"
@@ -1302,7 +1861,10 @@ function PollBlock({
               {isEditing ? "Done" : "Edit"}
             </button>
             <button
-              onClick={onDelete}
+              onClick={() => {
+                onDelete();
+                onTyping(null);
+              }}
               className="p-1.5 rounded-lg hover:bg-rose-50 hover:text-rose-600 text-slate-400 transition"
             >
               <Trash2 className="w-3.5 h-3.5" />
@@ -1313,8 +1875,13 @@ function PollBlock({
 
       {isEditing && isOwner ? (
         <input
-          value={poll.question}
-          onChange={(e) => onUpdate({ poll_data: { ...poll, question: e.target.value } })}
+          value={localPoll.question}
+          onChange={(e) => {
+            setLocalPoll({ ...localPoll, question: e.target.value });
+            onTyping(blockId);
+          }}
+          onFocus={() => onTyping(blockId)}
+          onBlur={() => onTyping(null)}
           placeholder="Poll question..."
           className="w-full bg-transparent border-b border-blue-400 focus:outline-none text-base font-bold text-slate-800 mb-3"
         />
@@ -1325,7 +1892,7 @@ function PollBlock({
       )}
 
       <div className="space-y-2">
-        {poll.options.map((opt, idx) => {
+        {localPoll.options.map((opt, idx) => {
           const pct = totalVotes > 0 ? (opt.votes / totalVotes) * 100 : 0;
           return (
             <div key={opt.id} className="space-y-1">
@@ -1335,23 +1902,27 @@ function PollBlock({
                     value={opt.text}
                     onChange={(e) => {
                       const updated: PollData = {
-                        ...poll,
-                        options: poll.options.map((o) =>
+                        ...localPoll,
+                        options: localPoll.options.map((o) =>
                           o.id === opt.id ? { ...o, text: e.target.value } : o
                         ),
                       };
-                      onUpdate({ poll_data: updated });
+                      setLocalPoll(updated);
+                      onTyping(blockId);
                     }}
+                    onFocus={() => onTyping(blockId)}
+                    onBlur={() => onTyping(null)}
                     placeholder={`Option ${idx + 1} text...`}
                     className="flex-1 text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-blue-400"
                   />
                   <button
                     onClick={() => {
                       const updated: PollData = {
-                        ...poll,
-                        options: poll.options.filter((o) => o.id !== opt.id),
+                        ...localPoll,
+                        options: localPoll.options.filter((o) => o.id !== opt.id),
                       };
-                      onUpdate({ poll_data: updated });
+                      setLocalPoll(updated);
+                      onTyping(blockId);
                     }}
                     className="p-1.5 rounded-lg hover:bg-rose-50 hover:text-rose-600 text-slate-400 transition"
                   >
@@ -1389,12 +1960,13 @@ function PollBlock({
           <button
             onClick={() => {
               const updated: PollData = {
-                ...poll,
-                options: [...poll.options, { id: crypto.randomUUID(), text: "", votes: 0 }],
+                ...localPoll,
+                options: [...localPoll.options, { id: crypto.randomUUID(), text: "", votes: 0 }],
               };
-              onUpdate({ poll_data: updated });
+              setLocalPoll(updated);
+              onTyping(blockId);
             }}
-            className="text-[10px] font-mono text-blue-600 hover:text-blue-700 transition flex items-center gap-1"
+            className="text-[10px] font-mono text-blue-600 hover:text-blue-700 transition flex items-center gap-1 cursor-pointer"
           >
             <Plus className="w-3 h-3" /> Add option
           </button>
@@ -1405,6 +1977,13 @@ function PollBlock({
           {totalVotes} {totalVotes === 1 ? "vote" : "votes"} total
         </p>
       )}
+      {typingUsers && typingUsers.length > 0 && (
+        <div className="text-[10px] text-blue-600 font-semibold font-sans flex items-center gap-1 mt-1.5 select-none animate-pulse">
+          <span className="inline-block w-1.5 h-1.5 rounded-full bg-blue-500 animate-ping mr-1"></span>
+          <span className="italic">{getTypingIndicatorText(typingUsers)}</span>
+        </div>
+      )}
     </div>
   );
 }
+
